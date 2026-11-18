@@ -28,12 +28,13 @@ jobs:
       - name: Publish Headless Server Agent Kad.exe
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Continue'
           $out = (dotnet publish windows/KADRemote.Agent/KADRemote.Agent.csproj -c Release -r win-x64 -p:DebugType=none -p:DebugSymbols=false -o out/agent 2>&1) | ForEach-Object { "$_" }
           $code = $LASTEXITCODE
           $out | ForEach-Object { Write-Host $_ }
           if ($code -ne 0) {
-            $errs = ($out | Select-String -Pattern "error " | Select-Object -First 10 | ForEach-Object { $_.Line }) -join " | "
-            if (-not $errs) { $errs = ($out | Select-Object -Last 10) -join " | " }
+            $errs = ($out | Select-String -Pattern "error " | Select-Object -First 8 | ForEach-Object { $_.Line.Trim() }) -join " | "
+            if (-not $errs) { $errs = ($out | Select-Object -Last 8) -join " | " }
             Write-Host "::error::$errs"
             exit $code
           }
