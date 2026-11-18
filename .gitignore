@@ -1,0 +1,21 @@
+# .NET / Windows
+bin/
+obj/
+out/
+dist/
+*.user
+*.suo
+*.vs/
+*.pdb
+
+# iOS / Xcode
+*.xcodeproj/
+build/
+DerivedData/
+Payload/
+*.ipa
+*.xcarchive
+
+# OS / Misc
+.DS_Store
+Thumbs.db

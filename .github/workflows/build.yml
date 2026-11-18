@@ -1,0 +1,101 @@
+name: Build KAD Remote (Kad.exe & Kad.ipa)
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Kad.exe (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Publish single-file Kad.exe
+        run: |
+          dotnet publish windows/KADRemote.Host/KADRemote.Host.csproj -c Release -r win-x64 -p:DebugType=none -p:DebugSymbols=false -o out/windows
+
+      - name: Upload Kad.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kad-Windows
+          path: out/windows/Kad.exe
+
+  build-ios:
+    name: Build Kad.ipa (Unsigned iOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios/KADRemote
+        run: xcodegen generate
+
+      - name: Build unsigned Kad.app
+        working-directory: ios/KADRemote
+        run: |
+          xcodebuild \
+            -project KADRemote.xcodeproj \
+            -scheme Kad \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            clean build
+
+      - name: Package unsigned Kad.ipa
+        working-directory: ios/KADRemote
+        run: |
+          mkdir -p out/Payload
+          cp -R build/Build/Products/Release-iphoneos/Kad.app out/Payload/
+          cd out
+          zip -r -y Kad.ipa Payload
+
+      - name: Upload Kad.ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kad-iOS-Unsigned
+          path: ios/KADRemote/out/Kad.ipa
+
+  release:
+    name: Publish Release (Kad.exe & Kad.ipa)
+    needs: [ build-windows, build-ios ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Kad.exe
+        uses: actions/download-artifact@v4
+        with:
+          name: Kad-Windows
+          path: release-assets
+
+      - name: Download Kad.ipa
+        uses: actions/download-artifact@v4
+        with:
+          name: Kad-iOS-Unsigned
+          path: release-assets
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'KAD Remote Latest Build' }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          files: |
+            release-assets/Kad.exe
+            release-assets/Kad.ipa
