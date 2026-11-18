@@ -18,16 +18,20 @@
 4. **Chạy file & Quản lý tiến trình trên PC**
    - Chạy `.exe`, `.bat`, `.cmd`, `.ps1`, hoặc mở bất kỳ file nào trên PC (hỗ trợ tham số, quyền Admin, chờ & xem output).
    - Xem Task Manager & tắt ứng dụng bị treo, Khóa màn hình / Ngủ / Khởi động lại / Tắt PC.
-5. **Kết nối cực dễ qua mã QR**
+5. **Kết nối cực dễ qua mã QR hoặc Xuất cấu hình `Kad.exe` hàng loạt**
    - `Kad.exe` tích hợp sẵn **Cloudflare Quick Tunnel** (tự động tạo link `https://*.trycloudflare.com` không cần mở port router) và sinh **QR Code** để app iPhone quét kết nối trong 1 giây.
+   - **Xuất cấu hình (`Kad.exe` Headless)**: Tạo file `Kad.exe` cấu hình sẵn ngay trên iPhone để cài lên hàng chục Windows Server nội bộ — chạy ẩn hoàn toàn (không hiện Tray/Taskbar), siêu nhẹ RAM (~9 MB private RAM), tự tìm & kết nối về iPhone.
+6. **Chạy nền trên iOS (khi user cho phép)**
+   - Bật **Chạy nền** trong app iOS để giữ Hub lắng nghe và duy trì kết nối tới các Windows Server ngay cả khi chuyển app / tắt màn hình.
 
 ---
 
 ## Cấu trúc dự án
 
-- `windows/KADRemote.Host/`: App Windows Host (.NET 9 WPF + Kestrel Server) → build ra **`Kad.exe`** (single-file).
+- `windows/KADRemote.Host/`: App Windows Host GUI (.NET 9 WPF + Kestrel Server) → build ra **`Kad.exe`** (single-file, có QR & Tunnel).
+- `windows/KADRemote.Agent/`: Headless Windows Server Agent (.NET 9 Minimal Kestrel, không WPF/WinForms/Tray, Workstation GC, trimmed) → nhúng vào `Kad.ipa` để app iOS xuất ra **`Kad.exe`** đã gắn sẵn cấu hình.
 - `ios/KADRemote/`: App iOS SwiftUI (XcodeGen) → build ra **`Kad.ipa`** (unsigned).
-- `.github/workflows/build.yml`: Tự động build cả `Kad.exe` và `Kad.ipa` (unsigned) và đẩy lên GitHub Releases.
+- `.github/workflows/build.yml`: Tự động build `Kad.exe`, template headless agent (nhúng vào `Kad.ipa`), và `Kad.ipa` (unsigned) rồi đẩy 2 file `Kad.exe` & `Kad.ipa` lên GitHub Releases.
 
 ---
 

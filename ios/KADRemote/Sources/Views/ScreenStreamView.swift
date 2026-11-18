@@ -60,7 +60,7 @@ struct ScreenStreamView: View {
     @State private var panOffset: CGSize = .zero
     @State private var lastPanOffset: CGSize = .zero
 
-    @State private var wsTask: URLSessionWebSocketTask?
+    @State private var wsClient: KADWebSocketClient?
     @State private var showTypeSheet = false
     @State private var textToType = ""
     @State private var toastMessage: String?
@@ -370,7 +370,7 @@ struct ScreenStreamView: View {
     private func startStream() {
         stopStream()
         guard let client = store.client,
-              let task = client.makeWebSocket(
+              let socket = client.openWebSocket(
                 path: "/ws/screen",
                 queryItems: [
                     URLQueryItem(name: "monitor", value: "\(selectedMonitor)"),
@@ -380,20 +380,9 @@ struct ScreenStreamView: View {
                 ]
               ) else { return }
 
-        wsTask = task
+        wsClient = socket
         isStreaming = true
-        task.resume()
-        receiveFrame(task)
-    }
-
-    private func stopStream() {
-        wsTask?.cancel(with: .normalClosure, reason: nil)
-        wsTask = nil
-        isStreaming = false
-    }
-
-    private func receiveFrame(_ task: URLSessionWebSocketTask) {
-        task.receive { result in
+        socket.start { result in
             switch result {
             case .success(let message):
                 if case .data(let data) = message, let img = UIImage(data: data) {
@@ -401,7 +390,6 @@ struct ScreenStreamView: View {
                         self.currentImage = img
                     }
                 }
-                self.receiveFrame(task)
 
             case .failure:
                 DispatchQueue.main.async {
@@ -409,6 +397,12 @@ struct ScreenStreamView: View {
                 }
             }
         }
+    }
+
+    private func stopStream() {
+        wsClient?.close()
+        wsClient = nil
+        isStreaming = false
     }
 
     private func sendConfig() {
@@ -427,10 +421,10 @@ struct ScreenStreamView: View {
     }
 
     private func sendInput(_ dict: [String: Any]) {
-        guard let task = wsTask,
+        guard let socket = wsClient,
               let data = try? JSONSerialization.data(withJSONObject: dict),
               let str = String(data: data, encoding: .utf8) else { return }
-        task.send(.string(str)) { _ in }
+        socket.sendText(str)
     }
 
     private func showToast(_ msg: String) {

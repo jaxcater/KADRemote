@@ -2,6 +2,8 @@ import SwiftUI
 
 struct DashboardView: View {
     @EnvironmentObject private var store: ConnectionStore
+    @EnvironmentObject private var backgroundManager: BackgroundManager
+    @EnvironmentObject private var hub: AgentHubServer
 
     @State private var info: SystemInfo?
     @State private var isLoading = false
@@ -119,6 +121,28 @@ struct DashboardView: View {
                             .foregroundColor(.primary)
                             .cornerRadius(12)
                         }
+
+                        // Background Mode Toggle
+                        Toggle(isOn: Binding(
+                            get: { backgroundManager.isBackgroundEnabled },
+                            set: { backgroundManager.setEnabled($0) }
+                        )) {
+                            HStack(spacing: 10) {
+                                Image(systemName: backgroundManager.isBackgroundEnabled ? "bolt.shield.fill" : "moon.zzz.fill")
+                                    .foregroundColor(backgroundManager.isBackgroundEnabled ? .green : .secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Chạy nền (Background Mode)")
+                                        .font(.subheadline.weight(.semibold))
+                                    Text("Hub :\(hub.hubPort) • \(hub.onlineAgents.count) server đang kết nối")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                        .tint(.green)
+                        .padding()
+                        .background(Color(.secondarySystemBackground))
+                        .cornerRadius(12)
 
                         // Power Controls
                         VStack(alignment: .leading, spacing: 10) {

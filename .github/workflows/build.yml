@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build-windows:
-    name: Build Kad.exe (Windows x64)
+    name: Build Kad.exe & Headless Server Agent (Windows x64)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,9 +21,13 @@ jobs:
         with:
           dotnet-version: "9.0.x"
 
-      - name: Publish single-file Kad.exe
+      - name: Publish GUI Host Kad.exe
         run: |
           dotnet publish windows/KADRemote.Host/KADRemote.Host.csproj -c Release -r win-x64 -p:DebugType=none -p:DebugSymbols=false -o out/windows
+
+      - name: Publish Headless Server Agent Kad.exe
+        run: |
+          dotnet publish windows/KADRemote.Agent/KADRemote.Agent.csproj -c Release -r win-x64 -p:DebugType=none -p:DebugSymbols=false -o out/agent
 
       - name: Upload Kad.exe artifact
         uses: actions/upload-artifact@v4
@@ -31,11 +35,29 @@ jobs:
           name: Kad-Windows
           path: out/windows/Kad.exe
 
+      - name: Upload Headless Agent template artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kad-Windows-Agent
+          path: out/agent/Kad.exe
+
   build-ios:
     name: Build Kad.ipa (Unsigned iOS)
+    needs: [ build-windows ]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download Headless Agent Template into iOS Bundle Resources
+        uses: actions/download-artifact@v4
+        with:
+          name: Kad-Windows-Agent
+          path: ios/KADRemote/Sources/Resources
+
+      - name: Rename Agent Template for iOS Bundle
+        run: |
+          mv ios/KADRemote/Sources/Resources/Kad.exe ios/KADRemote/Sources/Resources/KadAgentTemplate.exe
+          ls -lh ios/KADRemote/Sources/Resources/KadAgentTemplate.exe
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -58,6 +80,11 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
             clean build
+
+      - name: Verify KadAgentTemplate.exe bundled in Kad.app
+        working-directory: ios/KADRemote
+        run: |
+          test -f build/Build/Products/Release-iphoneos/Kad.app/KadAgentTemplate.exe
 
       - name: Package unsigned Kad.ipa
         working-directory: ios/KADRemote
@@ -96,6 +123,8 @@ jobs:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
           name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'KAD Remote Latest Build' }}
           prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          make_latest: ${{ startsWith(github.ref, 'refs/tags/') }}
+          generate_release_notes: true
           files: |
             release-assets/Kad.exe
             release-assets/Kad.ipa

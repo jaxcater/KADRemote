@@ -2,17 +2,20 @@ import SwiftUI
 
 struct ConnectView: View {
     @EnvironmentObject private var store: ConnectionStore
+    @EnvironmentObject private var hub: AgentHubServer
+    @EnvironmentObject private var backgroundManager: BackgroundManager
 
     @State private var nameInput = ""
     @State private var urlInput = ""
     @State private var tokenInput = ""
     @State private var showScanner = false
+    @State private var showExportConfig = false
     @State private var localAlert: String?
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 20) {
+                VStack(spacing: 16) {
                     // Brand Hero
                     VStack(spacing: 10) {
                         ZStack {
@@ -31,13 +34,13 @@ struct ConnectView: View {
                         }
                         Text("KAD Remote")
                             .font(.largeTitle.bold())
-                        Text("Quản lý PC Windows từ xa mọi lúc mọi nơi")
+                        Text("Quản lý PC & hàng loạt Windows Server từ xa")
                             .font(.subheadline)
                             .foregroundColor(.secondary)
                     }
-                    .padding(.top, 12)
+                    .padding(.top, 8)
 
-                    // Quick QR Scan Button
+                    // Quick Action 1: QR Scan
                     Button {
                         showScanner = true
                     } label: {
@@ -47,7 +50,7 @@ struct ConnectView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Quét mã QR từ PC")
                                     .font(.headline)
-                                Text("Kết nối trong 1 giây từ app Kad.exe")
+                                Text("Kết nối nhanh 1 máy từ Kad.exe GUI")
                                     .font(.caption)
                                     .opacity(0.85)
                             }
@@ -65,29 +68,130 @@ struct ConnectView: View {
                         .cornerRadius(14)
                     }
 
-                    // Saved PCs
+                    // Quick Action 2: Export Pre-configured Kad.exe
+                    Button {
+                        showExportConfig = true
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "arrow.down.doc.fill")
+                                .font(.title2)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Xuất cấu hình (Tạo Kad.exe)")
+                                    .font(.headline)
+                                Text("Cài vào nhiều Windows Server — tự kết nối về máy này")
+                                    .font(.caption)
+                                    .opacity(0.85)
+                                    .multilineTextAlignment(.leading)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                        }
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(Color.blue.opacity(0.2))
+                        .foregroundColor(.blue)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14)
+                                .stroke(Color.blue.opacity(0.5), lineWidth: 1)
+                        )
+                        .cornerRadius(14)
+                    }
+
+                    // Background Mode & Hub Listener Card
+                    VStack(alignment: .leading, spacing: 10) {
+                        Toggle(isOn: Binding(
+                            get: { backgroundManager.isBackgroundEnabled },
+                            set: { backgroundManager.setEnabled($0) }
+                        )) {
+                            HStack(spacing: 10) {
+                                Image(systemName: backgroundManager.isBackgroundEnabled ? "bolt.shield.fill" : "moon.zzz.fill")
+                                    .font(.title3)
+                                    .foregroundColor(backgroundManager.isBackgroundEnabled ? .green : .secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Chạy nền khi thoát ứng dụng")
+                                        .font(.subheadline.weight(.semibold))
+                                    Text(backgroundManager.isBackgroundEnabled
+                                         ? "Đang bật — giữ Hub lắng nghe & kết nối server"
+                                         : "Cho phép giữ kết nối Windows Server ở chế độ nền")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                        .tint(.green)
+
+                        Divider()
+
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(hub.isListening ? Color.green : Color.orange)
+                                .frame(width: 8, height: 8)
+                            Text(hub.listenerStatus)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Text("\(hub.onlineAgents.count) online")
+                                .font(.caption.bold())
+                                .foregroundColor(hub.onlineAgents.isEmpty ? .secondary : .green)
+                        }
+                    }
+                    .padding()
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(14)
+
+                    // Saved PCs / Auto-connected Servers
                     if !store.savedPCs.isEmpty {
                         VStack(alignment: .leading, spacing: 10) {
-                            Text("Máy tính đã lưu")
-                                .font(.headline)
+                            HStack {
+                                Text("Máy tính & Server (\(store.savedPCs.count))")
+                                    .font(.headline)
+                                Spacer()
+                            }
 
                             ForEach(store.savedPCs) { pc in
+                                let live = store.liveStatus(for: pc)
+                                let isOnline = live != nil
+
                                 HStack {
                                     Button {
                                         Task { await store.selectPC(pc) }
                                     } label: {
                                         HStack(spacing: 12) {
-                                            Image(systemName: "desktopcomputer")
-                                                .font(.title2)
-                                                .foregroundColor(.cyan)
+                                            ZStack(alignment: .bottomTrailing) {
+                                                Image(systemName: pc.isAutoDiscovered == true ? "server.rack" : "desktopcomputer")
+                                                    .font(.title2)
+                                                    .foregroundColor(isOnline ? .green : .cyan)
+                                                Circle()
+                                                    .fill(isOnline ? Color.green : Color.gray)
+                                                    .frame(width: 9, height: 9)
+                                                    .offset(x: 2, y: 2)
+                                            }
                                             VStack(alignment: .leading, spacing: 2) {
-                                                Text(pc.name)
-                                                    .font(.headline)
-                                                    .foregroundColor(.primary)
-                                                Text(pc.normalizedUrl)
-                                                    .font(.caption)
-                                                    .foregroundColor(.secondary)
-                                                    .lineLimit(1)
+                                                HStack(spacing: 6) {
+                                                    Text(pc.name)
+                                                        .font(.headline)
+                                                        .foregroundColor(.primary)
+                                                    if isOnline {
+                                                        Text("ONLINE")
+                                                            .font(.system(size: 9, weight: .bold))
+                                                            .padding(.horizontal, 5)
+                                                            .padding(.vertical, 2)
+                                                            .background(Color.green.opacity(0.2))
+                                                            .foregroundColor(.green)
+                                                            .cornerRadius(4)
+                                                    }
+                                                }
+                                                if let live {
+                                                    Text("CPU \(String(format: "%.0f", live.cpuUsagePercent))% • RAM \(ByteFormatter.format(live.usedMemoryBytes))/\(ByteFormatter.format(live.totalMemoryBytes))")
+                                                        .font(.caption)
+                                                        .foregroundColor(.secondary)
+                                                        .lineLimit(1)
+                                                } else {
+                                                    Text(pc.normalizedUrl)
+                                                        .font(.caption)
+                                                        .foregroundColor(.secondary)
+                                                        .lineLimit(1)
+                                                }
                                             }
                                             Spacer()
                                             if store.isConnecting && store.activePC?.id == pc.id {
@@ -182,6 +286,10 @@ struct ConnectView: View {
                         localAlert = "Mã QR không phải của KAD Remote."
                     }
                 }
+            }
+            .sheet(isPresented: $showExportConfig) {
+                ExportConfigSheet()
+                    .environmentObject(hub)
             }
         }
     }

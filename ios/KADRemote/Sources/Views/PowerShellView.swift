@@ -18,7 +18,7 @@ struct PowerShellView: View {
     @State private var history: [String] = []
     @State private var historyIndex: Int = -1
     @State private var isConnected = false
-    @State private var wsTask: URLSessionWebSocketTask?
+    @State private var wsClient: KADWebSocketClient?
 
     private let quickCommands = [
         "Get-Process | Sort-Object CPU -Descending | Select-Object -First 10",
@@ -150,7 +150,7 @@ struct PowerShellView: View {
                 }
             }
             .onAppear {
-                if wsTask == nil {
+                if wsClient == nil {
                     connectShell()
                 }
             }
@@ -189,24 +189,13 @@ struct PowerShellView: View {
     private func connectShell() {
         disconnectShell()
         guard let client = store.client,
-              let task = client.makeWebSocket(path: "/ws/ps") else {
+              let socket = client.openWebSocket(path: "/ws/ps") else {
             appendLine(.stderr, "Không thể tạo WebSocket tới PowerShell.")
             return
         }
-        wsTask = task
-        task.resume()
+        wsClient = socket
         isConnected = true
-        receiveLoop(task)
-    }
-
-    private func disconnectShell() {
-        wsTask?.cancel(with: .normalClosure, reason: nil)
-        wsTask = nil
-        isConnected = false
-    }
-
-    private func receiveLoop(_ task: URLSessionWebSocketTask) {
-        task.receive { result in
+        socket.start { result in
             DispatchQueue.main.async {
                 switch result {
                 case .success(let message):
@@ -222,7 +211,6 @@ struct PowerShellView: View {
                         }
                         appendChunk(kind, payload)
                     }
-                    self.receiveLoop(task)
 
                 case .failure(let error):
                     self.isConnected = false
@@ -232,9 +220,15 @@ struct PowerShellView: View {
         }
     }
 
+    private func disconnectShell() {
+        wsClient?.close()
+        wsClient = nil
+        isConnected = false
+    }
+
     private func sendCommand(_ cmd: String) {
         appendLine(.command, "> \(cmd)")
-        if !isConnected || wsTask == nil {
+        if !isConnected || wsClient == nil {
             connectShell()
         }
         sendJSON(["type": "input", "data": cmd])
@@ -245,10 +239,10 @@ struct PowerShellView: View {
     }
 
     private func sendJSON(_ dict: [String: Any]) {
-        guard let task = wsTask,
+        guard let socket = wsClient,
               let data = try? JSONSerialization.data(withJSONObject: dict),
               let str = String(data: data, encoding: .utf8) else { return }
-        task.send(.string(str)) { error in
+        socket.sendText(str) { error in
             if let error {
                 DispatchQueue.main.async {
                     self.appendLine(.stderr, "Lỗi gửi lệnh: \(error.localizedDescription)")

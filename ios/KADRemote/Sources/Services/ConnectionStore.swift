@@ -8,17 +8,45 @@ final class ConnectionStore: ObservableObject {
     @Published var isConnected: Bool = false
     @Published var isConnecting: Bool = false
     @Published var errorMessage: String?
+    @Published var relayMachineIds: Set<String> = []
 
     private let pcsKey = "kad_saved_pcs_v1"
     private let activeIdKey = "kad_active_pc_id_v1"
 
+    weak var hub: AgentHubServer?
+    weak var backgroundManager: BackgroundManager?
+
     var client: APIClient? {
         guard let pc = activePC else { return nil }
-        return APIClient(pc: pc)
+        let useRelay = pc.machineId.map { relayMachineIds.contains($0) } ?? false
+        return APIClient(pc: pc, hub: hub, preferRelay: useRelay)
     }
 
     init() {
         load()
+    }
+
+    func attach(hub: AgentHubServer, backgroundManager: BackgroundManager) {
+        self.hub = hub
+        self.backgroundManager = backgroundManager
+
+        hub.onAgentRegistered = { [weak self] status, token in
+            Task { @MainActor [weak self] in
+                self?.handleAgentRegistered(status, token: token)
+            }
+        }
+
+        hub.onAgentDisconnected = { [weak self] machineId, name in
+            Task { @MainActor [weak self] in
+                self?.backgroundManager?.notifyIfInBackground(
+                    title: "KAD Remote",
+                    body: "\(name) đã ngắt kết nối khỏi Hub."
+                )
+                if self?.activePC?.machineId == machineId {
+                    // Keep saved, relay will resume when agent reconnects
+                }
+            }
+        }
     }
 
     private func load() {
@@ -47,12 +75,74 @@ final class ConnectionStore: ObservableObject {
         }
     }
 
+    func handleAgentRegistered(_ status: AgentLiveStatus, token: String) {
+        let bestUrl = status.localUrls.first
+            ?? (status.remoteIP.isEmpty ? "http://127.0.0.1:\(status.agentPort)" : "http://\(status.remoteIP):\(status.agentPort)")
+
+        if let idx = savedPCs.firstIndex(where: { $0.machineId == status.machineId || $0.normalizedUrl == bestUrl }) {
+            var existing = savedPCs[idx]
+            existing.name = status.deviceName
+            existing.url = bestUrl
+            existing.token = token
+            existing.machineId = status.machineId
+            existing.isAutoDiscovered = true
+            existing.lastConnected = Date()
+            existing.lastSeenCpu = status.cpuUsagePercent
+            existing.lastSeenUsedRam = status.usedMemoryBytes
+            existing.lastSeenTotalRam = status.totalMemoryBytes
+            savedPCs[idx] = existing
+            if activePC?.id == existing.id {
+                activePC = existing
+            }
+        } else {
+            let newPC = SavedPC(
+                name: status.deviceName,
+                url: bestUrl,
+                token: token,
+                lastConnected: Date(),
+                machineId: status.machineId,
+                isAutoDiscovered: true,
+                lastSeenCpu: status.cpuUsagePercent,
+                lastSeenUsedRam: status.usedMemoryBytes,
+                lastSeenTotalRam: status.totalMemoryBytes
+            )
+            savedPCs.insert(newPC, at: 0)
+            backgroundManager?.notifyIfInBackground(
+                title: "Server mới đã kết nối",
+                body: "\(status.deviceName) (\(bestUrl)) đã tự động ghép nối."
+            )
+        }
+        save()
+    }
+
+    func isAgentOnline(_ pc: SavedPC) -> Bool {
+        guard let mid = pc.machineId else { return false }
+        return hub?.onlineAgents[mid] != nil
+    }
+
+    func liveStatus(for pc: SavedPC) -> AgentLiveStatus? {
+        guard let mid = pc.machineId else { return nil }
+        return hub?.onlineAgents[mid]
+    }
+
     func reconnectActive() async {
         guard let pc = activePC else { return }
         isConnecting = true
         errorMessage = nil
+
+        // Check direct connectivity first if machine has a live hub session, so we know whether to use fast direct LAN or firewall-bypass relay
+        if let mid = pc.machineId, hub?.hasActiveSession(machineId: mid) == true {
+            let directClient = APIClient(pc: pc, hub: hub, preferRelay: false)
+            if let _ = try? await directClient.pingDirectOnly(timeout: 1.5) {
+                relayMachineIds.remove(mid)
+            } else {
+                relayMachineIds.insert(mid)
+            }
+        }
+
         do {
-            let resp = try await APIClient(pc: pc).ping()
+            let useRelay = pc.machineId.map { relayMachineIds.contains($0) } ?? false
+            let resp = try await APIClient(pc: pc, hub: hub, preferRelay: useRelay).ping()
             var updated = pc
             if !resp.deviceName.isEmpty {
                 updated.name = resp.deviceName
@@ -80,7 +170,7 @@ final class ConnectionStore: ObservableObject {
         )
 
         do {
-            let pingResp = try await APIClient(pc: candidate).ping()
+            let pingResp = try await APIClient(pc: candidate, hub: hub).ping()
             if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !pingResp.deviceName.isEmpty {
                 candidate.name = pingResp.deviceName
             }
@@ -119,7 +209,9 @@ final class ConnectionStore: ObservableObject {
     }
 
     private func upsertPC(_ pc: SavedPC) {
-        if let idx = savedPCs.firstIndex(where: { $0.normalizedUrl == pc.normalizedUrl }) {
+        if let idx = savedPCs.firstIndex(where: {
+            ($0.machineId != nil && $0.machineId == pc.machineId) || $0.normalizedUrl == pc.normalizedUrl
+        }) {
             var existing = pc
             existing.id = savedPCs[idx].id
             savedPCs[idx] = existing

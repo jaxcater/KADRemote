@@ -6,6 +6,11 @@ struct SavedPC: Codable, Identifiable, Equatable {
     var url: String
     var token: String
     var lastConnected: Date?
+    var machineId: String?
+    var isAutoDiscovered: Bool?
+    var lastSeenCpu: Double?
+    var lastSeenUsedRam: Int64?
+    var lastSeenTotalRam: Int64?
 
     var normalizedUrl: String {
         var trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -17,6 +22,30 @@ struct SavedPC: Codable, Identifiable, Equatable {
         }
         return trimmed
     }
+}
+
+struct AgentExportConfig: Codable {
+    var controllerHost: String
+    var controllerPort: Int
+    var controllerToken: String
+    var agentPort: Int
+    var startWithWindows: Bool
+    var udpDiscovery: Bool
+    var exportedBy: String?
+    var exportedAt: String?
+}
+
+struct AgentLiveStatus: Equatable {
+    let machineId: String
+    let deviceName: String
+    let localUrls: [String]
+    let agentPort: Int
+    let remoteIP: String
+    let cpuUsagePercent: Double
+    let totalMemoryBytes: Int64
+    let usedMemoryBytes: Int64
+    let uptimeSeconds: Int64
+    let lastHeartbeat: Date
 }
 
 struct PingResponse: Codable {
