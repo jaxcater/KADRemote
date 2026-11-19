@@ -42,7 +42,10 @@ struct KADRemoteApp: App {
                 @unknown default: .inactive
                 }
                 backgroundManager.handleScenePhase(proxy) {
-                    hub.start()
+                    hub.ensureRunning()
+                    Task {
+                        await store.discoverAgents(includeSubnetScan: false)
+                    }
                 }
             }
             .onOpenURL { url in

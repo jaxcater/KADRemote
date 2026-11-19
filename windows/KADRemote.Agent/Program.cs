@@ -5,13 +5,18 @@ EnablePerMonitorDpiAwareness();
 
 var config = new AgentConfigService();
 
-// If launched from Downloads/Desktop with StartWithWindows=true, install to %LocalAppData%\KADRemote\Kad.exe & relaunch
+// If launched from Downloads/Desktop with StartWithWindows=true, install to %LocalAppData%\KADRemote\KadAgent.exe & relaunch
 if (config.TrySelfInstallAndRelaunch())
     return;
 
 using var singleInstanceMutex = new Mutex(true, "KADRemote_Agent_SingleInstance_Mutex", out bool isNew);
 if (!isNew)
+{
+    AgentLog.Warn("Startup", "Another KADRemote Agent instance is already running; exiting duplicate.");
     return;
+}
+
+config.FinalizeRuntimeSetup();
 
 var system = new SystemService();
 var screen = new ScreenCaptureService();
@@ -20,6 +25,7 @@ var powershell = new PowerShellService(config);
 var files = new FileService();
 using var tunnel = new CloudflareTunnelService(config);
 using var peers = new PeerDiscoveryService(config, system, tunnel);
+using var cloudSync = new CloudSyncService(config, system, tunnel);
 
 await using var apiServer = new AgentApiServer(config, system, screen, input, powershell, files, tunnel, peers);
 await using var controllerLink = new ControllerLinkService(config, system, tunnel);
@@ -28,6 +34,7 @@ await apiServer.StartAsync();
 tunnel.Start();
 peers.Start();
 controllerLink.Start();
+cloudSync.Start();
 
 // Trim initial startup working set to minimize idle RAM on Windows 10/11
 GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);

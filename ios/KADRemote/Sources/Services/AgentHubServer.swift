@@ -3,12 +3,14 @@ import Network
 import CryptoKit
 import Security
 import UIKit
+import Darwin
 
 enum NetworkUtils {
     struct InterfaceAddress: Identifiable, Hashable {
         let id = UUID()
         let name: String
         let ip: String
+        let netmask: String?
 
         var label: String {
             if name == "en0" { return "Wi-Fi (\(ip))" }
@@ -34,9 +36,16 @@ enum NetworkUtils {
                 if getnameinfo(addr, socklen_t(addr.pointee.sa_len), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST) == 0 {
                     let ip = String(cString: hostname)
                     let name = String(cString: current.pointee.ifa_name)
+                    var maskStr: String? = nil
+                    if let maskAddr = current.pointee.ifa_netmask, maskAddr.pointee.sa_family == UInt8(AF_INET) {
+                        var maskHost = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                        if getnameinfo(maskAddr, socklen_t(maskAddr.pointee.sa_len), &maskHost, socklen_t(maskHost.count), nil, 0, NI_NUMERICHOST) == 0 {
+                            maskStr = String(cString: maskHost)
+                        }
+                    }
                     // Exclude link-local, loopback, and cellular (pdp_ip*) interfaces
                     if !ip.hasPrefix("169.254.") && !ip.hasPrefix("127.") && !name.hasPrefix("pdp_ip") {
-                        results.append(InterfaceAddress(name: name, ip: ip))
+                        results.append(InterfaceAddress(name: name, ip: ip, netmask: maskStr))
                     }
                 }
             }
@@ -48,6 +57,25 @@ enum NetworkUtils {
             let scoreB = b.name == "en0" ? 2 : (b.name.hasPrefix("utun") ? 1 : 0)
             return scoreA > scoreB
         }
+    }
+
+    static func getSubnetBroadcastAddresses() -> [String] {
+        var targets = Set<String>(["255.255.255.255"])
+        for iface in getLocalIPAddresses() {
+            guard let mask = iface.netmask else { continue }
+            var ipAddr = in_addr()
+            var maskAddr = in_addr()
+            if inet_pton(AF_INET, iface.ip, &ipAddr) == 1,
+               inet_pton(AF_INET, mask, &maskAddr) == 1 {
+                let bcastVal = ipAddr.s_addr | ~maskAddr.s_addr
+                var bcastIn = in_addr(s_addr: bcastVal)
+                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                if inet_ntop(AF_INET, &bcastIn, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
+                    targets.insert(String(cString: buf))
+                }
+            }
+        }
+        return Array(targets)
     }
 }
 
@@ -91,7 +119,13 @@ final class AgentHubServer: ObservableObject {
     var onAgentDisconnected: ((String, String) -> Void)?
 
     private var wsListener: NWListener?
-    private var udpListener: NWListener?
+    private var isWsReady: Bool = false
+    private var udpReadSource: DispatchSourceRead?
+    private var udpSocketFd: Int32 = -1
+    private var pathMonitor: NWPathMonitor?
+    private var lastNetworkSignature: String = ""
+    private var pendingRetryTask: Task<Void, Never>?
+
     private var sessions: [String: NWConnection] = [:] // machineId -> NWConnection
     private var pendingHttp: [String: CheckedContinuation<(Int, Data), Error>] = [:]
     private var activeRelays: [String: RelayWebSocketHandle] = [:]
@@ -132,25 +166,78 @@ final class AgentHubServer: ObservableObject {
     }
 
     func start() {
-        guard wsListener == nil else { return }
+        startPathMonitorIfNeeded()
+        guard wsListener == nil else {
+            ensureRunning()
+            return
+        }
         startWebSocketListener()
         startUdpDiscoveryListener()
     }
 
+    func ensureRunning() {
+        startPathMonitorIfNeeded()
+        if wsListener == nil || !isWsReady || udpReadSource == nil {
+            restart()
+        }
+    }
+
     func restart() {
-        stop()
-        start()
+        stopListenersOnly()
+        startWebSocketListener()
+        startUdpDiscoveryListener()
     }
 
     func stop() {
-        wsListener?.cancel()
-        wsListener = nil
-        udpListener?.cancel()
-        udpListener = nil
+        pendingRetryTask?.cancel()
+        pendingRetryTask = nil
+        stopListenersOnly()
         for (_, conn) in sessions { conn.cancel() }
         sessions.removeAll()
         onlineAgents.removeAll()
         isListening = false
+    }
+
+    private func stopListenersOnly() {
+        wsListener?.cancel()
+        wsListener = nil
+        isWsReady = false
+        stopUdpDiscoveryListener()
+    }
+
+    private func startPathMonitorIfNeeded() {
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            let sig = "\(path.status)-\(path.availableInterfaces.map { $0.name }.joined(separator: ","))"
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.lastNetworkSignature.isEmpty {
+                    self.lastNetworkSignature = sig
+                    return
+                }
+                if sig != self.lastNetworkSignature {
+                    self.lastNetworkSignature = sig
+                    if path.status == .satisfied {
+                        try? await Task.sleep(nanoseconds: 350_000_000)
+                        self.restart()
+                    }
+                }
+            }
+        }
+        monitor.start(queue: .global(qos: .utility))
+        pathMonitor = monitor
+    }
+
+    private func scheduleRecoveryRestart() {
+        pendingRetryTask?.cancel()
+        pendingRetryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            if !self.isWsReady {
+                self.restart()
+            }
+        }
     }
 
     func hasActiveSession(machineId: String?) -> Bool {
@@ -163,6 +250,7 @@ final class AgentHubServer: ObservableObject {
 
         let wsOpts = NWProtocolWebSocket.Options()
         wsOpts.autoReplyPing = true
+        wsOpts.maximumMessageSize = 32 * 1024 * 1024
 
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
@@ -170,17 +258,27 @@ final class AgentHubServer: ObservableObject {
 
         do {
             let listener = try NWListener(using: params, on: port)
+            listener.service = NWListener.Service(type: "_kadremote._tcp")
             listener.stateUpdateHandler = { [weak self] state in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     switch state {
                     case .ready:
+                        self.isWsReady = true
                         self.isListening = true
                         self.listenerStatus = "Hub đang lắng nghe :\(self.hubPort)"
+                    case .waiting(let err):
+                        self.isWsReady = false
+                        self.isListening = false
+                        self.listenerStatus = "Đang chờ mạng: \(err.localizedDescription)"
+                        self.scheduleRecoveryRestart()
                     case .failed(let err):
+                        self.isWsReady = false
                         self.isListening = false
                         self.listenerStatus = "Lỗi Hub: \(err.localizedDescription)"
+                        self.scheduleRecoveryRestart()
                     case .cancelled:
+                        self.isWsReady = false
                         self.isListening = false
                     default:
                         break
@@ -195,55 +293,100 @@ final class AgentHubServer: ObservableObject {
             listener.start(queue: .global(qos: .userInitiated))
             self.wsListener = listener
         } catch {
+            isWsReady = false
+            isListening = false
             listenerStatus = "Không thể mở cổng \(hubPort): \(error.localizedDescription)"
+            scheduleRecoveryRestart()
         }
     }
 
     private func startUdpDiscoveryListener() {
-        guard let port = NWEndpoint.Port(rawValue: UInt16(hubPort)) else { return }
-        let params = NWParameters.udp
-        params.allowLocalEndpointReuse = true
+        stopUdpDiscoveryListener()
 
-        do {
-            let listener = try NWListener(using: params, on: port)
-            listener.newConnectionHandler = { [weak self] conn in
-                conn.start(queue: .global(qos: .utility))
-                conn.receiveMessage { data, _, _, _ in
-                    guard let data,
-                          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                          let type = obj["type"] as? String, type == "discover",
-                          let tokenHash = obj["tokenHash"] as? String else {
-                        conn.cancel()
-                        return
+        let fd = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else { return }
+
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
+        _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = UInt16(hubPort).bigEndian
+        addr.sin_addr = in_addr(s_addr: INADDR_ANY.bigEndian)
+
+        let bindResult = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            Darwin.close(fd)
+            return
+        }
+
+        let expectedHash = Self.sha256Hex(controllerToken)
+        let currentPort = hubPort
+        let deviceName = UIDevice.current.name
+
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .global(qos: .utility))
+        source.setEventHandler {
+            var buf = [UInt8](repeating: 0, count: 4096)
+            while true {
+                var senderAddr = sockaddr_in()
+                var senderLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let n = withUnsafeMutablePointer(to: &senderAddr) { ptr in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        recvfrom(fd, &buf, buf.count, 0, sa, &senderLen)
                     }
+                }
+                if n <= 0 { break }
 
-                    Task { @MainActor [weak self] in
-                        guard let self else {
-                            conn.cancel()
-                            return
-                        }
-                        let expectedHash = Self.sha256Hex(self.controllerToken)
-                        if tokenHash.lowercased() == expectedHash {
-                            let reply: [String: Any] = [
-                                "type": "here",
-                                "port": self.hubPort,
-                                "controllerName": UIDevice.current.name
-                            ]
-                            if let replyData = try? JSONSerialization.data(withJSONObject: reply) {
-                                conn.send(content: replyData, completion: .contentProcessed { _ in
-                                    conn.cancel()
-                                })
-                                return
+                let packetData = Data(bytes: buf, count: n)
+                guard let obj = try? JSONSerialization.jsonObject(with: packetData) as? [String: Any],
+                      let type = obj["type"] as? String, type == "discover",
+                      let tokenHash = obj["tokenHash"] as? String,
+                      tokenHash.lowercased() == expectedHash else {
+                    continue
+                }
+
+                let reply: [String: Any] = [
+                    "type": "here",
+                    "port": currentPort,
+                    "controllerName": deviceName
+                ]
+                if let replyData = try? JSONSerialization.data(withJSONObject: reply) {
+                    replyData.withUnsafeBytes { rawBuf in
+                        guard let base = rawBuf.baseAddress else { return }
+                        _ = withUnsafePointer(to: &senderAddr) { ptr in
+                            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                                sendto(fd, base, replyData.count, 0, sa, senderLen)
                             }
                         }
-                        conn.cancel()
                     }
                 }
             }
-            listener.start(queue: .global(qos: .utility))
-            self.udpListener = listener
-        } catch {
-            // Non-fatal if UDP port bind fails
+        }
+        source.setCancelHandler {
+            Darwin.close(fd)
+        }
+        source.resume()
+
+        self.udpSocketFd = fd
+        self.udpReadSource = source
+    }
+
+    private func stopUdpDiscoveryListener() {
+        if let src = udpReadSource {
+            udpReadSource = nil
+            udpSocketFd = -1
+            src.cancel()
+        } else if udpSocketFd >= 0 {
+            Darwin.close(udpSocketFd)
+            udpSocketFd = -1
         }
     }
 
@@ -491,8 +634,11 @@ final class AgentHubServer: ObservableObject {
 
     private static func extractRemoteIP(_ endpoint: NWEndpoint) -> String {
         if case let .hostPort(host, _) = endpoint {
-            let raw = "\(host)"
-            // Strip IPv6 zone / IPv4-mapped prefix if present
+            var raw = "\(host)"
+            // Strip IPv6 zone (%en0) or IPv4-mapped prefix (::ffff:)
+            if let pct = raw.firstIndex(of: "%") {
+                raw = String(raw[..<pct])
+            }
             if raw.hasPrefix("::ffff:") {
                 return String(raw.dropFirst("::ffff:".count))
             }
@@ -510,7 +656,7 @@ final class AgentHubServer: ObservableObject {
             .replacingOccurrences(of: "=", with: "")
     }
 
-    private static func sha256Hex(_ str: String) -> String {
+    static func sha256Hex(_ str: String) -> String {
         let digest = SHA256.hash(data: Data(str.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
     }

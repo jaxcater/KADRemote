@@ -11,6 +11,7 @@ struct ExportConfigSheet: View {
     @State private var startWithWindows: Bool = true
     @State private var udpDiscovery: Bool = true
     @State private var enableCloudflareTunnel: Bool = true
+    @State private var enableCloudSync: Bool = true
     @State private var cloudflareTunnelToken: String = ""
     @State private var cloudflareTunnelUrl: String = ""
 
@@ -122,6 +123,8 @@ struct ExportConfigSheet: View {
 
                     Toggle("Tự khởi động cùng Windows", isOn: $startWithWindows)
                     Toggle("Tự tìm iPhone qua LAN (UDP)", isOn: $udpDiscovery)
+                    Toggle("Tự nhận Server qua Cloud (mã hóa E2E)", isOn: $enableCloudSync)
+                        .tint(.cyan)
                 }
 
                 if let errorMessage {
@@ -166,6 +169,7 @@ struct ExportConfigSheet: View {
                 }
             }
             .onAppear {
+                hub.ensureRunning()
                 detectedIPs = NetworkUtils.getLocalIPAddresses()
                 if controllerHost.isEmpty {
                     controllerHost = detectedIPs.first?.ip ?? ""
@@ -175,7 +179,12 @@ struct ExportConfigSheet: View {
             }
             .sheet(isPresented: Binding(
                 get: { exportedURL != nil },
-                set: { if !$0 { exportedURL = nil } }
+                set: {
+                    if !$0 {
+                        exportedURL = nil
+                        hub.ensureRunning()
+                    }
+                }
             )) {
                 if let url = exportedURL {
                     ExportShareSheet(activityItems: [url])
@@ -195,9 +204,19 @@ struct ExportConfigSheet: View {
         }
 
         let cleanHost = controllerHost.trimmingCharacters(in: .whitespacesAndNewlines)
-        if cleanHost.isEmpty && !udpDiscovery {
-            errorMessage = "Hãy nhập IP của iPhone hoặc bật Tự tìm iPhone qua LAN."
+        if cleanHost.isEmpty && !udpDiscovery && !enableCloudSync {
+            errorMessage = "Hãy nhập IP của iPhone hoặc bật Tự tìm qua LAN / Cloud."
             return
+        }
+
+        var allHosts: [String] = []
+        if !cleanHost.isEmpty {
+            allHosts.append(cleanHost)
+        }
+        for item in detectedIPs {
+            if !allHosts.contains(item.ip) {
+                allHosts.append(item.ip)
+            }
         }
 
         let cleanCfToken = cloudflareTunnelToken.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -208,16 +227,19 @@ struct ExportConfigSheet: View {
         }
 
         hub.updatePorts(hub: hubPort, agent: agentPort)
+        hub.ensureRunning()
         isBuilding = true
 
         let cfg = AgentExportConfig(
             controllerHost: cleanHost,
+            controllerHosts: allHosts,
             controllerPort: hubPort,
             controllerToken: hub.controllerToken,
             agentPort: agentPort,
             startWithWindows: startWithWindows,
             udpDiscovery: udpDiscovery,
             enableCloudflareTunnel: enableCloudflareTunnel,
+            enableCloudSync: enableCloudSync,
             cloudflareTunnelToken: cleanCfToken.isEmpty ? nil : cleanCfToken,
             cloudflareTunnelUrl: cleanCfUrl.isEmpty ? nil : cleanCfUrl,
             exportedBy: UIDevice.current.name,

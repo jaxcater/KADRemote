@@ -190,7 +190,8 @@ final class APIClient {
                 return data
             } catch let err as APIError {
                 if case .unauthorized = err { throw err }
-                if case .httpError(let code, _) = err, (400...499).contains(code) { throw err }
+                let isTunnelBase = base.lowercased().hasPrefix("https://")
+                if !isTunnelBase, case .httpError(let code, _) = err, (400...499).contains(code) { throw err }
                 lastError = err
             } catch {
                 lastError = error
@@ -339,25 +340,44 @@ final class APIClient {
             return destURL
         }
 
-        let req = try makeRequest(
-            base: baseURL,
-            path: "/api/files/download",
-            queryItems: [URLQueryItem(name: "path", value: remotePath)],
-            timeout: 300
-        )
-        let (tempURL, resp) = try await session.download(for: req)
-        guard let http = resp as? HTTPURLResponse else {
-            throw APIError.invalidURL
-        }
-        if http.statusCode == 401 {
-            throw APIError.unauthorized
-        }
-        if !(200...299).contains(http.statusCode) {
-            throw APIError.httpError(http.statusCode, "Tải file thất bại")
+        var lastError: Error = APIError.invalidURL
+        for base in ([baseURL] + fallbackURLs) {
+            do {
+                let req = try makeRequest(
+                    base: base,
+                    path: "/api/files/download",
+                    queryItems: [URLQueryItem(name: "path", value: remotePath)],
+                    timeout: 300
+                )
+                let (tempURL, resp) = try await session.download(for: req)
+                guard let http = resp as? HTTPURLResponse else {
+                    throw APIError.invalidURL
+                }
+                if http.statusCode == 401 {
+                    throw APIError.unauthorized
+                }
+                if !(200...299).contains(http.statusCode) {
+                    throw APIError.httpError(http.statusCode, "Tải file thất bại")
+                }
+
+                try FileManager.default.moveItem(at: tempURL, to: destURL)
+                return destURL
+            } catch let err as APIError {
+                if case .unauthorized = err { throw err }
+                lastError = err
+            } catch {
+                lastError = error
+            }
         }
 
-        try FileManager.default.moveItem(at: tempURL, to: destURL)
-        return destURL
+        if let machineId, let hub, await hub.hasActiveSession(machineId: machineId) {
+            let pq = buildPathAndQuery(path: "/api/files/download", queryItems: [URLQueryItem(name: "path", value: remotePath)])
+            let data = try await sendViaRelay(machineId: machineId, hub: hub, method: "GET", pathAndQuery: pq, contentType: "application/octet-stream", body: nil)
+            try data.write(to: destURL)
+            return destURL
+        }
+
+        throw lastError
     }
 
     func uploadData(_ data: Data, filename: String, toDir dir: String) async throws {

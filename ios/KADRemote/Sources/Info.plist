@@ -49,6 +49,10 @@
     <string>Quét mã QR trên ứng dụng KAD Remote Windows để kết nối nhanh với PC.</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Kết nối tới máy tính và nhận kết nối tự động từ các Windows Server trong mạng nội bộ / Tailscale.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_kadremote._tcp</string>
+    </array>
     <key>NSPhotoLibraryUsageDescription</key>
     <string>Chọn ảnh hoặc video từ iPhone để gửi sang PC.</string>
     <key>NSPhotoLibraryAddUsageDescription</key>

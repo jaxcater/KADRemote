@@ -26,14 +26,14 @@ public sealed class ControllerLinkService : IAsyncDisposable
     private SemaphoreSlim? _heartbeatWakeSignal;
 
     private Task? _loopTask;
-    private string _activeHost;
+    private string? _activeHost;
 
     public ControllerLinkService(AgentConfigService config, SystemService system, CloudflareTunnelService tunnel)
     {
         _config = config;
         _system = system;
         _tunnel = tunnel;
-        _activeHost = config.Config.ControllerHost;
+        _activeHost = config.GetCandidateControllerHosts().FirstOrDefault();
         _networkWakeSignal = new SemaphoreSlim(0, 1);
         _heartbeatWakeSignal = new SemaphoreSlim(0, 1);
         _localHttp = new HttpClient
@@ -86,45 +86,64 @@ public sealed class ControllerLinkService : IAsyncDisposable
         {
             try
             {
-                if (string.IsNullOrWhiteSpace(_activeHost) && _config.Config.UdpDiscovery)
+                var candidates = new List<string>();
+                if (!string.IsNullOrWhiteSpace(_activeHost))
+                    candidates.Add(_activeHost);
+                foreach (var h in _config.GetCandidateControllerHosts())
                 {
-                    var found = await DiscoverControllerIpAsync(ct);
-                    if (!string.IsNullOrWhiteSpace(found))
-                        _activeHost = found;
+                    if (!candidates.Contains(h, StringComparer.OrdinalIgnoreCase))
+                        candidates.Add(h);
                 }
 
-                if (!string.IsNullOrWhiteSpace(_activeHost))
+                bool connectedAny = false;
+                foreach (var host in candidates)
                 {
-                    await ConnectAndServeAsync(_activeHost, _config.Config.ControllerPort, ct);
-                    failCount = 0;
+                    if (ct.IsCancellationRequested) break;
+                    try
+                    {
+                        await ConnectAndServeAsync(host, _config.Config.ControllerPort, ct);
+                        _activeHost = host;
+                        failCount = 0;
+                        connectedAny = true;
+                        break;
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        AgentLog.Warn("HubLink", $"Connect to {host}:{_config.Config.ControllerPort} failed: {ex.Message}");
+                    }
                 }
-                else
+
+                if (!connectedAny && _config.Config.UdpDiscovery)
                 {
+                    var discovered = await DiscoverControllerIpAsync(ct);
+                    if (!string.IsNullOrWhiteSpace(discovered))
+                    {
+                        AgentLog.Info("HubLink", $"UDP discovered controller at {discovered}");
+                        _activeHost = discovered;
+                        await ConnectAndServeAsync(discovered, _config.Config.ControllerPort, ct);
+                        failCount = 0;
+                        connectedAny = true;
+                    }
+                }
+
+                if (!connectedAny)
                     failCount++;
-                }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 break;
             }
-            catch
+            catch (Exception ex)
             {
                 failCount++;
-                if (_config.Config.UdpDiscovery && failCount >= 2)
-                {
-                    var discovered = await DiscoverControllerIpAsync(ct);
-                    if (!string.IsNullOrWhiteSpace(discovered))
-                    {
-                        _activeHost = discovered;
-                        failCount = 0;
-                        continue;
-                    }
-                    if (failCount % 4 == 0 && !string.IsNullOrWhiteSpace(_config.Config.ControllerHost))
-                        _activeHost = _config.Config.ControllerHost;
-                }
+                AgentLog.Warn("HubLink", $"Hub loop error: {ex.Message}");
             }
 
-            int delayMs = Math.Min(8000, 2000 + failCount * 1000);
+            int delayMs = Math.Min(8000, 1500 + failCount * 1000);
             try
             {
                 if (_networkWakeSignal != null)
@@ -142,10 +161,11 @@ public sealed class ControllerLinkService : IAsyncDisposable
         ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(15);
 
         using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        connectCts.CancelAfter(TimeSpan.FromSeconds(5));
+        connectCts.CancelAfter(TimeSpan.FromSeconds(3));
 
         var uri = new Uri($"ws://{host}:{port}/ws/agent");
         await ws.ConnectAsync(uri, connectCts.Token);
+        AgentLog.Info("HubLink", $"Connected to Hub {uri}");
 
         using var sendLock = new SemaphoreSlim(1, 1);
 

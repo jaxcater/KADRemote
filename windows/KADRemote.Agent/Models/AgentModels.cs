@@ -5,12 +5,14 @@ namespace KADRemote.Agent.Models;
 public sealed class EmbeddedAgentConfig
 {
     public string ControllerHost { get; set; } = string.Empty;
+    public List<string>? ControllerHosts { get; set; }
     public int ControllerPort { get; set; } = 7789;
     public string ControllerToken { get; set; } = string.Empty;
     public int AgentPort { get; set; } = 7788;
     public bool StartWithWindows { get; set; } = true;
     public bool UdpDiscovery { get; set; } = true;
     public bool EnableCloudflareTunnel { get; set; } = true;
+    public bool EnableCloudSync { get; set; } = true;
     public string? CloudflareTunnelToken { get; set; }
     public string? CloudflareTunnelUrl { get; set; }
     public string? ExportedBy { get; set; }
@@ -35,7 +37,8 @@ public sealed record SystemInfoDto(
     int MonitorCount,
     List<DiskInfoDto> Disks,
     List<string> LocalUrls,
-    string? TunnelUrl
+    string? TunnelUrl,
+    string? MachineId = null
 );
 
 public sealed record ProcessInfoDto(
@@ -163,6 +166,25 @@ public sealed record UdpDiscoverPacket(
     string DeviceName
 );
 
+public sealed record UdpAgentDiscoverPacket(
+    string Type,
+    string TokenHash
+);
+
+public sealed record CloudAnnouncementDto(
+    string Type,
+    string MachineId,
+    string DeviceName,
+    int AgentPort,
+    List<string> LocalUrls,
+    string? TunnelUrl,
+    double CpuUsagePercent,
+    long TotalMemoryBytes,
+    long UsedMemoryBytes,
+    long UptimeSeconds,
+    DateTimeOffset TimestampUtc
+);
+
 public sealed record AgentRegisterMessage(
     string Type,
     string Token,
@@ -231,6 +253,8 @@ public sealed record RelayWsEvent(
 [JsonSerializable(typeof(List<PeerInfoDto>))]
 [JsonSerializable(typeof(UdpPeerBeaconPacket))]
 [JsonSerializable(typeof(UdpDiscoverPacket))]
+[JsonSerializable(typeof(UdpAgentDiscoverPacket))]
+[JsonSerializable(typeof(CloudAnnouncementDto))]
 [JsonSerializable(typeof(AgentRegisterMessage))]
 [JsonSerializable(typeof(AgentHeartbeatMessage))]
 [JsonSerializable(typeof(RelayHttpResponse))]

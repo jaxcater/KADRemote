@@ -63,9 +63,10 @@ public sealed partial class CloudflareTunnelService : IDisposable
             {
                 break;
             }
-            catch
+            catch (Exception ex)
             {
                 failCount++;
+                AgentLog.Warn("Tunnel", $"Tunnel loop error: {ex.Message}");
             }
 
             SetPublicUrl(null);
@@ -137,6 +138,8 @@ public sealed partial class CloudflareTunnelService : IDisposable
     {
         if (string.Equals(PublicUrl, url, StringComparison.Ordinal)) return;
         PublicUrl = url;
+        if (!string.IsNullOrEmpty(url))
+            AgentLog.Info("Tunnel", $"Tunnel URL ready: {url}");
         TunnelUrlChanged?.Invoke(url);
     }
 

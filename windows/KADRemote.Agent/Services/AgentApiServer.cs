@@ -100,7 +100,7 @@ public sealed class AgentApiServer : IAsyncDisposable
         app.MapGet("/api/peers", () => Results.Ok(_peers.GetPeers()));
 
         app.MapGet("/api/system/info", () =>
-            Results.Ok(_system.GetSystemInfo(_config.DeviceName, _config.Config.AgentPort, _tunnel.PublicUrl)));
+            Results.Ok(_system.GetSystemInfo(_config.DeviceName, _config.Config.AgentPort, _tunnel.PublicUrl, _config.MachineId)));
 
         app.MapGet("/api/processes", () => Results.Ok(_system.GetProcesses()));
 

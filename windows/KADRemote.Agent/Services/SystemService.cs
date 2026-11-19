@@ -99,7 +99,7 @@ public sealed class SystemService
 
     public List<string> GetLocalUrls(int port)
     {
-        var urls = new List<string>();
+        var candidates = new List<(string Url, int Score)>();
         try
         {
             foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
@@ -107,25 +107,52 @@ public sealed class SystemService
                 if (ni.OperationalStatus != OperationalStatus.Up) continue;
                 if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
 
+                var desc = $"{ni.Name} {ni.Description}".ToLowerInvariant();
+                bool isVirtual = desc.Contains("virtualbox")
+                    || desc.Contains("vmware")
+                    || desc.Contains("hyper-v")
+                    || desc.Contains("vethernet")
+                    || desc.Contains("wsl")
+                    || desc.Contains("docker")
+                    || desc.Contains("loopback");
+
+                bool isVpn = desc.Contains("tailscale")
+                    || desc.Contains("wireguard")
+                    || desc.Contains("zerotier")
+                    || desc.Contains("wintun");
+
                 var props = ni.GetIPProperties();
+                bool hasGateway = props.GatewayAddresses.Any(g =>
+                    g.Address.AddressFamily == AddressFamily.InterNetwork &&
+                    !g.Address.Equals(System.Net.IPAddress.Any));
+
                 foreach (var addr in props.UnicastAddresses)
                 {
                     if (addr.Address.AddressFamily != AddressFamily.InterNetwork) continue;
                     var ip = addr.Address.ToString();
                     if (ip.StartsWith("169.254.", StringComparison.Ordinal)) continue;
-                    urls.Add($"http://{ip}:{port}");
+
+                    int score = 0;
+                    if (hasGateway && !isVirtual) score += 100;
+                    if (isVpn || ip.StartsWith("100.", StringComparison.Ordinal)) score += 60;
+                    if (ip.StartsWith("192.168.", StringComparison.Ordinal) || ip.StartsWith("10.", StringComparison.Ordinal)) score += 20;
+                    if (isVirtual) score -= 80;
+                    if (ip.StartsWith("192.168.56.", StringComparison.Ordinal)) score -= 50; // VirtualBox default host-only
+
+                    candidates.Add(($"http://{ip}:{port}", score));
                 }
             }
         }
         catch { }
 
-        return urls
+        return candidates
+            .OrderByDescending(c => c.Score)
+            .Select(c => c.Url)
             .Distinct()
-            .OrderByDescending(u => u.Contains("192.168.") || u.Contains("10.") || u.Contains("100."))
             .ToList();
     }
 
-    public SystemInfoDto GetSystemInfo(string deviceName, int port, string? tunnelUrl = null)
+    public SystemInfoDto GetSystemInfo(string deviceName, int port, string? tunnelUrl = null, string? machineId = null)
     {
         var (totalMem, usedMem) = GetMemoryBytes();
         var disks = new List<DiskInfoDto>();
@@ -158,7 +185,8 @@ public sealed class SystemService
             MonitorCount: monitors,
             Disks: disks,
             LocalUrls: GetLocalUrls(port),
-            TunnelUrl: tunnelUrl
+            TunnelUrl: tunnelUrl,
+            MachineId: machineId
         );
     }
 

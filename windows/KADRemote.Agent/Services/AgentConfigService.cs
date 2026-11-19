@@ -39,17 +39,44 @@ public sealed class AgentConfigService
         NormalizeConfig();
 
         StripZoneIdentifier(Environment.ProcessPath);
+    }
+
+    public void FinalizeRuntimeSetup()
+    {
+        if (HasEmbeddedConfig)
+            SaveConfigBackup();
 
         if (Config.StartWithWindows)
             ApplyWindowsStartup(true, Environment.ProcessPath);
 
         _ = Task.Run(EnsureFirewallRuleIfElevated);
+
+        var hosts = string.Join(", ", GetCandidateControllerHosts());
+        AgentLog.Info("Config", $"Startup: MachineId={MachineId}, Device={DeviceName}, Embedded={HasEmbeddedConfig}, AgentPort={Config.AgentPort}, HubPort={Config.ControllerPort}, Hosts=[{hosts}], Udp={Config.UdpDiscovery}, Tunnel={Config.EnableCloudflareTunnel}, CloudSync={Config.EnableCloudSync}");
+    }
+
+    public List<string> GetCandidateControllerHosts()
+    {
+        var list = new List<string>();
+        if (Config.ControllerHosts != null)
+        {
+            foreach (var h in Config.ControllerHosts)
+            {
+                var trimmed = h?.Trim();
+                if (!string.IsNullOrEmpty(trimmed) && !list.Contains(trimmed, StringComparer.OrdinalIgnoreCase))
+                    list.Add(trimmed);
+            }
+        }
+        var primary = Config.ControllerHost?.Trim();
+        if (!string.IsNullOrEmpty(primary) && !list.Contains(primary, StringComparer.OrdinalIgnoreCase))
+            list.Add(primary);
+        return list;
     }
 
     /// <summary>
     /// When launched from a downloaded/shared Kad.exe (e.g. Downloads/Desktop) with StartWithWindows enabled,
-    /// copies itself to %LocalAppData%\KADRemote\Kad.exe, strips MOTW, registers auto-start, and launches the installed copy
-    /// so the user can move/delete the original file and the agent survives reboots on Windows 10/11.
+    /// copies itself to %LocalAppData%\KADRemote\KadAgent.exe, strips MOTW, registers auto-start, and launches the installed copy
+    /// so the user can move/delete the original file and the agent survives reboots on Windows 10/11/Server.
     /// Returns true if relaunched and the current process should exit.
     /// </summary>
     public bool TrySelfInstallAndRelaunch()
@@ -64,7 +91,8 @@ public sealed class AgentConfigService
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "KADRemote"
         );
-        var installedExe = Path.Combine(installDir, "Kad.exe");
+        var installedExe = Path.Combine(installDir, "KadAgent.exe");
+        var legacyInstalledExe = Path.Combine(installDir, "Kad.exe");
 
         if (string.Equals(Path.GetFullPath(currentExe), Path.GetFullPath(installedExe), StringComparison.OrdinalIgnoreCase))
             return false;
@@ -73,37 +101,47 @@ public sealed class AgentConfigService
         {
             Directory.CreateDirectory(installDir);
 
-            // Stop any previously installed instance so we can replace Kad.exe cleanly
-            foreach (var proc in Process.GetProcessesByName("Kad"))
+            // Stop any previously installed agent instance so we can replace KadAgent.exe cleanly
+            foreach (var procName in new[] { "KadAgent", "Kad" })
             {
-                try
+                foreach (var proc in Process.GetProcessesByName(procName))
                 {
-                    if (proc.Id == Environment.ProcessId) continue;
-                    string? procPath = null;
-                    try { procPath = proc.MainModule?.FileName; } catch { }
-                    if (procPath == null || string.Equals(Path.GetFullPath(procPath), Path.GetFullPath(installedExe), StringComparison.OrdinalIgnoreCase))
+                    try
                     {
-                        proc.Kill(entireProcessTree: true);
-                        proc.WaitForExit(3000);
+                        if (proc.Id == Environment.ProcessId) continue;
+                        string? procPath = null;
+                        try { procPath = proc.MainModule?.FileName; } catch { }
+                        if (procPath == null) continue;
+
+                        var fullProc = Path.GetFullPath(procPath);
+                        if (string.Equals(fullProc, Path.GetFullPath(installedExe), StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(fullProc, Path.GetFullPath(legacyInstalledExe), StringComparison.OrdinalIgnoreCase))
+                        {
+                            proc.Kill(entireProcessTree: true);
+                            proc.WaitForExit(3000);
+                        }
                     }
+                    catch { }
+                    finally { proc.Dispose(); }
                 }
-                catch { }
-                finally { proc.Dispose(); }
             }
 
             // Copy with brief retry in case file handle is still releasing
-            for (int attempt = 0; attempt < 5; attempt++)
+            for (int attempt = 0; attempt < 6; attempt++)
             {
                 try
                 {
                     File.Copy(currentExe, installedExe, overwrite: true);
                     break;
                 }
-                catch when (attempt < 4)
+                catch when (attempt < 5)
                 {
-                    Thread.Sleep(300);
+                    Thread.Sleep(350);
                 }
             }
+
+            if (HasEmbeddedConfig)
+                SaveConfigBackup();
 
             StripZoneIdentifier(installedExe);
             ApplyWindowsStartup(true, installedExe);
@@ -116,14 +154,33 @@ public sealed class AgentConfigService
                 CreateNoWindow = true
             });
 
+            AgentLog.Info("Install", $"Self-installed and relaunched from {installedExe}");
             return true;
         }
-        catch
+        catch (Exception ex)
         {
-            // Fallback: keep running from current location & register current path
+            AgentLog.Warn("Install", $"Self-install fallback to current path ({currentExe}): {ex.Message}");
+            if (HasEmbeddedConfig)
+                SaveConfigBackup();
             ApplyWindowsStartup(true, currentExe);
             return false;
         }
+    }
+
+    private void SaveConfigBackup()
+    {
+        try
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "KADRemote"
+            );
+            Directory.CreateDirectory(dir);
+            var localPath = Path.Combine(dir, "agent.json");
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(Config, AgentJsonContext.Default.EmbeddedAgentConfig);
+            File.WriteAllBytes(localPath, bytes);
+        }
+        catch { }
     }
 
     private EmbeddedAgentConfig LoadConfig()
@@ -334,8 +391,17 @@ public sealed class AgentConfigService
                 return;
 
             int port = Config.AgentPort;
-            var ruleName = $"KADRemote-TCP-{port}";
+            int peerPort = Math.Clamp(Config.ControllerPort + 1, 1025, 65535);
+            EnsureNetshFirewallRule($"KADRemote-TCP-{port}", "TCP", port);
+            EnsureNetshFirewallRule($"KADRemote-UDP-{peerPort}", "UDP", peerPort);
+        }
+        catch { }
+    }
 
+    private static void EnsureNetshFirewallRule(string ruleName, string protocol, int port)
+    {
+        try
+        {
             using var check = Process.Start(new ProcessStartInfo
             {
                 FileName = "netsh",
@@ -352,7 +418,7 @@ public sealed class AgentConfigService
             using var add = Process.Start(new ProcessStartInfo
             {
                 FileName = "netsh",
-                Arguments = $"advfirewall firewall add rule name=\"{ruleName}\" dir=in action=allow protocol=TCP localport={port}",
+                Arguments = $"advfirewall firewall add rule name=\"{ruleName}\" dir=in action=allow protocol={protocol} localport={port} profile=any",
                 CreateNoWindow = true,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,

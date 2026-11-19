@@ -39,12 +39,14 @@ struct SavedPC: Codable, Identifiable, Equatable {
 
 struct AgentExportConfig: Codable {
     var controllerHost: String
+    var controllerHosts: [String]?
     var controllerPort: Int
     var controllerToken: String
     var agentPort: Int
     var startWithWindows: Bool
     var udpDiscovery: Bool
     var enableCloudflareTunnel: Bool = true
+    var enableCloudSync: Bool = true
     var cloudflareTunnelToken: String?
     var cloudflareTunnelUrl: String?
     var exportedBy: String?
@@ -111,6 +113,7 @@ struct SystemInfo: Codable {
     let disks: [DiskInfo]
     let localUrls: [String]
     let tunnelUrl: String?
+    let machineId: String?
 
     var memoryRatio: Double {
         guard totalMemoryBytes > 0 else { return 0 }

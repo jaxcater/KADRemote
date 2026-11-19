@@ -98,8 +98,25 @@ public sealed class PeerDiscoveryService : IDisposable
             try
             {
                 var res = await _listener.ReceiveAsync(ct);
+                using var doc = JsonDocument.Parse(res.Buffer);
+                var root = doc.RootElement;
+                var type = root.TryGetProperty("type", out var tp) ? tp.GetString() : null;
+
+                if (type == "discover_agent")
+                {
+                    var tokenHash = root.TryGetProperty("tokenHash", out var th) ? th.GetString() : null;
+                    if (string.Equals(tokenHash, _tokenHash, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var replyBytes = BuildBeaconBytes();
+                        await _listener.SendAsync(replyBytes, res.RemoteEndPoint, ct);
+                        AgentLog.Info("PeerDiscovery", $"Replied to iPhone agent discovery from {res.RemoteEndPoint}");
+                    }
+                    continue;
+                }
+
+                if (type != "peer_beacon") continue;
                 var pkt = JsonSerializer.Deserialize(res.Buffer, AgentJsonContext.Default.UdpPeerBeaconPacket);
-                if (pkt == null || pkt.Type != "peer_beacon") continue;
+                if (pkt == null) continue;
                 if (!string.Equals(pkt.TokenHash, _tokenHash, StringComparison.OrdinalIgnoreCase)) continue;
                 if (string.IsNullOrWhiteSpace(pkt.MachineId) || pkt.MachineId == _config.MachineId) continue;
 
@@ -135,6 +152,25 @@ public sealed class PeerDiscoveryService : IDisposable
         }
     }
 
+    private byte[] BuildBeaconBytes()
+    {
+        var (tot, used) = _system.GetMemoryBytes();
+        var pkt = new UdpPeerBeaconPacket(
+            Type: "peer_beacon",
+            TokenHash: _tokenHash,
+            MachineId: _config.MachineId,
+            DeviceName: _config.DeviceName,
+            AgentPort: _config.Config.AgentPort,
+            LocalUrls: _system.GetLocalUrls(_config.Config.AgentPort),
+            TunnelUrl: _tunnel.PublicUrl,
+            CpuUsagePercent: _system.GetCpuUsagePercent(),
+            TotalMemoryBytes: tot,
+            UsedMemoryBytes: used,
+            UptimeSeconds: Environment.TickCount64 / 1000
+        );
+        return JsonSerializer.SerializeToUtf8Bytes(pkt, AgentJsonContext.Default.UdpPeerBeaconPacket);
+    }
+
     private async Task SendBeaconAsync(CancellationToken ct)
     {
         try
@@ -142,21 +178,7 @@ public sealed class PeerDiscoveryService : IDisposable
             using var udp = new UdpClient();
             udp.EnableBroadcast = true;
 
-            var (tot, used) = _system.GetMemoryBytes();
-            var pkt = new UdpPeerBeaconPacket(
-                Type: "peer_beacon",
-                TokenHash: _tokenHash,
-                MachineId: _config.MachineId,
-                DeviceName: _config.DeviceName,
-                AgentPort: _config.Config.AgentPort,
-                LocalUrls: _system.GetLocalUrls(_config.Config.AgentPort),
-                TunnelUrl: _tunnel.PublicUrl,
-                CpuUsagePercent: _system.GetCpuUsagePercent(),
-                TotalMemoryBytes: tot,
-                UsedMemoryBytes: used,
-                UptimeSeconds: Environment.TickCount64 / 1000
-            );
-            var bytes = JsonSerializer.SerializeToUtf8Bytes(pkt, AgentJsonContext.Default.UdpPeerBeaconPacket);
+            var bytes = BuildBeaconBytes();
 
             foreach (var target in GetBroadcastTargets())
             {

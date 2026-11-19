@@ -134,6 +134,35 @@ struct ConnectView: View {
                                 .font(.caption.bold())
                                 .foregroundColor(hub.onlineAgents.isEmpty ? .secondary : .green)
                         }
+
+                        Divider()
+
+                        HStack(spacing: 10) {
+                            if store.isDiscovering {
+                                ProgressView()
+                                    .scaleEffect(0.75)
+                            }
+                            Text(store.discoveryStatus ?? "Tự tìm Server trong LAN, UDP & Cloud")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .lineLimit(2)
+                            Spacer()
+                            Button {
+                                Task {
+                                    hub.ensureRunning()
+                                    await store.discoverAgents(includeSubnetScan: true)
+                                }
+                            } label: {
+                                Label("Tìm Server", systemImage: "antenna.radiowaves.left.and.right")
+                                    .font(.caption.bold())
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(Color.cyan.opacity(0.18))
+                                    .foregroundColor(.cyan)
+                                    .cornerRadius(8)
+                            }
+                            .disabled(store.isDiscovering)
+                        }
                     }
                     .padding()
                     .background(Color(.secondarySystemBackground))
@@ -147,9 +176,12 @@ struct ConnectView: View {
                                     .font(.headline)
                                 Spacer()
                                 Button {
-                                    Task { await store.refreshRemoteStatuses() }
+                                    Task {
+                                        hub.ensureRunning()
+                                        await store.discoverAgents(includeSubnetScan: true)
+                                    }
                                 } label: {
-                                    if store.isRefreshingStatuses {
+                                    if store.isRefreshingStatuses || store.isDiscovering {
                                         ProgressView()
                                             .scaleEffect(0.8)
                                     } else {
@@ -300,10 +332,12 @@ struct ConnectView: View {
             .navigationTitle("Kết nối")
             .navigationBarTitleDisplayMode(.inline)
             .refreshable {
-                await store.refreshRemoteStatuses()
+                hub.ensureRunning()
+                await store.discoverAgents(includeSubnetScan: true)
             }
             .task {
-                await store.refreshRemoteStatuses()
+                hub.ensureRunning()
+                await store.discoverAgents(includeSubnetScan: true)
             }
             .sheet(isPresented: $showScanner) {
                 QRScannerView { raw in
@@ -319,7 +353,12 @@ struct ConnectView: View {
                     }
                 }
             }
-            .sheet(isPresented: $showExportConfig) {
+            .sheet(isPresented: $showExportConfig, onDismiss: {
+                hub.ensureRunning()
+                Task {
+                    await store.discoverAgents(includeSubnetScan: false)
+                }
+            }) {
                 ExportConfigSheet()
                     .environmentObject(hub)
             }
