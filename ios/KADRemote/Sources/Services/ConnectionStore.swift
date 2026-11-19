@@ -710,7 +710,7 @@ final class ConnectionStore: ObservableObject {
         let remoteIP: String
     }
 
-    private static func probeUdpAgents(token: String, peerPort: Int) async -> [UdpPeerReply] {
+    private nonisolated static func probeUdpAgents(token: String, peerPort: Int) async -> [UdpPeerReply] {
         await Task.detached(priority: .utility) {
             var results: [UdpPeerReply] = []
             let fd = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
@@ -803,7 +803,7 @@ final class ConnectionStore: ObservableObject {
         let uptimeSeconds: Int64?
     }
 
-    private static func fetchCloudAnnouncements(token: String) async -> [CloudAnnouncementPayload] {
+    private nonisolated static func fetchCloudAnnouncements(token: String) async -> [CloudAnnouncementPayload] {
         guard !token.isEmpty else { return [] }
         let topicHash = AgentHubServer.sha256Hex("kad-rendezvous-topic-v1:" + token)
         let topic = "kad_" + String(topicHash.prefix(24))
