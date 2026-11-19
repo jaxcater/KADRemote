@@ -12,6 +12,12 @@ if (config.TrySelfInstallAndRelaunch())
 using var singleInstanceMutex = new Mutex(true, "KADRemote_Agent_SingleInstance_Mutex", out bool isNew);
 if (!isNew)
 {
+    config.StopExistingAgentInstances();
+    Thread.Sleep(500);
+}
+using var retryMutex = isNew ? null : new Mutex(true, "KADRemote_Agent_SingleInstance_Mutex", out isNew);
+if (!isNew)
+{
     AgentLog.Warn("Startup", "Another KADRemote Agent instance is already running; exiting duplicate.");
     return;
 }

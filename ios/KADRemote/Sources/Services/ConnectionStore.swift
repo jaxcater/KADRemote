@@ -200,7 +200,7 @@ final class ConnectionStore: ObservableObject {
         let peerPort = min(max(hub.hubPort + 1, 1025), 65535)
 
         async let udpTask = Self.probeUdpAgents(token: token, peerPort: peerPort)
-        async let cloudTask = Self.fetchCloudAnnouncements(token: token)
+        async let cloudTask = Self.fetchCloudAnnouncements(token: token, requestLiveReply: true)
 
         let (udpPeers, cloudPeers) = await (udpTask, cloudTask)
 
@@ -237,6 +237,11 @@ final class ConnectionStore: ObservableObject {
                 totalRam: ann.totalMemoryBytes
             )
             if isNew { discoveredCount += 1 }
+            if let t = ann.tunnelUrl, !t.isEmpty,
+               let pc = savedPCs.first(where: { $0.machineId == ann.machineId }) {
+                remoteOnlineIds.insert(pc.id)
+                tunnelActiveIds.insert(pc.id)
+            }
         }
 
         if includeSubnetScan {
@@ -266,6 +271,58 @@ final class ConnectionStore: ObservableObject {
             discoveryStatus = nil
         } else {
             discoveryStatus = "Chưa thấy Server nào. Hãy chạy Kad.exe trên Windows."
+        }
+    }
+
+    /// Lightweight continuous background check while ConnectView is visible so newly started PCs pop up automatically on 4G/LAN.
+    func pollCloudAndUdpQuickly() async {
+        guard let hub, !isDiscovering else { return }
+        let token = hub.controllerToken
+        let peerPort = min(max(hub.hubPort + 1, 1025), 65535)
+
+        async let udpTask = Self.probeUdpAgents(token: token, peerPort: peerPort)
+        async let cloudTask = Self.fetchCloudAnnouncements(token: token, requestLiveReply: false)
+        let (udpPeers, cloudPeers) = await (udpTask, cloudTask)
+
+        for peer in udpPeers {
+            let best = Self.selectBestLocalUrl(from: peer.localUrls, remoteIP: peer.remoteIP, agentPort: peer.agentPort)
+            upsertDiscoveredServer(
+                machineId: peer.machineId,
+                deviceName: peer.deviceName,
+                bestUrl: best,
+                localUrls: peer.localUrls,
+                tunnelUrl: peer.tunnelUrl,
+                token: token,
+                cpu: peer.cpuUsagePercent,
+                usedRam: peer.usedMemoryBytes,
+                totalRam: peer.totalMemoryBytes
+            )
+            if let pc = savedPCs.first(where: { $0.machineId == peer.machineId }) {
+                remoteOnlineIds.insert(pc.id)
+            }
+        }
+
+        for ann in cloudPeers {
+            let best = Self.selectBestLocalUrl(from: ann.localUrls, remoteIP: nil, agentPort: ann.agentPort)
+            let fallbackUrl = best.isEmpty ? (ann.tunnelUrl ?? "http://127.0.0.1:\(ann.agentPort)") : best
+            upsertDiscoveredServer(
+                machineId: ann.machineId,
+                deviceName: ann.deviceName,
+                bestUrl: fallbackUrl,
+                localUrls: ann.localUrls,
+                tunnelUrl: ann.tunnelUrl,
+                token: token,
+                cpu: ann.cpuUsagePercent,
+                usedRam: ann.usedMemoryBytes,
+                totalRam: ann.totalMemoryBytes
+            )
+            if let t = ann.tunnelUrl, !t.isEmpty,
+               let pc = savedPCs.first(where: { $0.machineId == ann.machineId }) {
+                remoteOnlineIds.insert(pc.id)
+                if hub.onlineAgents[ann.machineId] == nil {
+                    tunnelActiveIds.insert(pc.id)
+                }
+            }
         }
     }
 
@@ -304,7 +361,7 @@ final class ConnectionStore: ObservableObject {
                 }
             }
 
-            for await (id, ok, viaTunnel, workingLan) in group {
+                    for await (id, ok, viaTunnel, workingLan) in group {
                 if ok {
                     onlineRemote.insert(id)
                     if viaTunnel {
@@ -318,6 +375,13 @@ final class ConnectionStore: ObservableObject {
                     if let pc = savedPCs.first(where: { $0.id == id }) {
                         reachableGateways.append((pc, viaTunnel))
                     }
+                } else if let pc = savedPCs.first(where: { $0.id == id }),
+                          pc.normalizedTunnelUrl != nil,
+                          let lastConn = pc.lastConnected,
+                          Date().timeIntervalSince(lastConn) < 90 {
+                    // Keep freshly announced Cloud Tunnel PC marked ready while Cloudflare edge DNS warms up
+                    onlineRemote.insert(id)
+                    tunnelActiveIds.insert(id)
                 }
             }
         }
@@ -430,24 +494,31 @@ final class ConnectionStore: ObservableObject {
             resolvedRoute = true
         }
 
-        // 3. Try saved Cloudflare Tunnel URL (when away from home / 4G)
-        if !resolvedRoute, let tunnel = pc.normalizedTunnelUrl,
-           (try? await probe.pingSpecificBase(tunnel, timeout: 3.5)) != nil {
-            tunnelActiveIds.insert(pc.id)
-            if let mid = pc.machineId { relayMachineIds.remove(mid) }
-            resolvedRoute = true
+        // 3. Try saved Cloudflare Tunnel URL (when away from home / 4G), with brief retry for fresh tunnel DNS warm-up
+        if !resolvedRoute, let tunnel = pc.normalizedTunnelUrl {
+            for attempt in 0..<3 {
+                if (try? await probe.pingSpecificBase(tunnel, timeout: 4.0)) != nil {
+                    tunnelActiveIds.insert(pc.id)
+                    if let mid = pc.machineId { relayMachineIds.remove(mid) }
+                    resolvedRoute = true
+                    break
+                }
+                if attempt < 2 {
+                    try? await Task.sleep(nanoseconds: 1_200_000_000)
+                }
+            }
         }
 
         // 4. Refresh rotated Tunnel URL from Encrypted Cloud Rendezvous or LAN peers
         if !resolvedRoute && !pc.token.isEmpty {
-            let anns = await Self.fetchCloudAnnouncements(token: pc.token)
+            let anns = await Self.fetchCloudAnnouncements(token: pc.token, requestLiveReply: true)
             if let match = anns.first(where: { $0.machineId == pc.machineId }),
                let newTunnel = match.tunnelUrl, !newTunnel.isEmpty {
                 pc.tunnelUrl = newTunnel
                 if !match.localUrls.isEmpty { pc.localUrls = match.localUrls }
                 upsertPC(pc)
                 activePC = pc
-                if (try? await APIClient(pc: pc).pingSpecificBase(newTunnel, timeout: 3.5)) != nil {
+                if (try? await APIClient(pc: pc).pingSpecificBase(newTunnel, timeout: 4.0)) != nil {
                     tunnelActiveIds.insert(pc.id)
                     resolvedRoute = true
                 }
@@ -803,20 +874,31 @@ final class ConnectionStore: ObservableObject {
         let uptimeSeconds: Int64?
     }
 
-    private nonisolated static func fetchCloudAnnouncements(token: String) async -> [CloudAnnouncementPayload] {
+    private nonisolated static func fetchCloudAnnouncements(token: String, requestLiveReply: Bool = false) async -> [CloudAnnouncementPayload] {
         guard !token.isEmpty else { return [] }
         let topicHash = AgentHubServer.sha256Hex("kad-rendezvous-topic-v1:" + token)
         let topic = "kad_" + String(topicHash.prefix(24))
         let keyDigest = SHA256.hash(data: Data(("kad-rendezvous-key-v1:" + token).utf8))
         let symKey = SymmetricKey(data: keyDigest)
 
-        guard let url = URL(string: "https://ntfy.sh/\(topic)/json?poll=1&since=12h") else {
+        if requestLiveReply, let postUrl = URL(string: "https://ntfy.sh/\(topic)") {
+            var postReq = URLRequest(url: postUrl)
+            postReq.httpMethod = "POST"
+            postReq.timeoutInterval = 4
+            postReq.setValue("no", forHTTPHeaderField: "Cache")
+            postReq.httpBody = Data("KADREQ1:discover".utf8)
+            _ = try? await URLSession.shared.data(for: postReq)
+            try? await Task.sleep(nanoseconds: 700_000_000)
+        }
+
+        guard let url = URL(string: "https://ntfy.sh/\(topic)/json?poll=1&since=all") else {
             return []
         }
 
         var req = URLRequest(url: url)
         req.timeoutInterval = 8
-        req.setValue("KADRemote-iOS/1.1", forHTTPHeaderField: "User-Agent")
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        req.setValue("KADRemote-iOS/1.3", forHTTPHeaderField: "User-Agent")
 
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               let http = resp as? HTTPURLResponse,
@@ -826,8 +908,8 @@ final class ConnectionStore: ObservableObject {
         }
 
         var latestByMachine: [String: CloudAnnouncementPayload] = [:]
-        for line in bodyStr.split(separator: "\n") {
-            guard let lineData = line.data(using: .utf8),
+        for line in bodyStr.split(whereSeparator: \.isNewline) {
+            guard let lineData = String(line).data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
                   (obj["event"] as? String) == "message",
                   let msg = obj["message"] as? String,
@@ -835,7 +917,7 @@ final class ConnectionStore: ObservableObject {
                 continue
             }
 
-            let b64 = String(msg.dropFirst("KADENC1:".count))
+            let b64 = String(msg.dropFirst("KADENC1:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
             guard let combined = Data(base64Encoded: b64),
                   let sealedBox = try? AES.GCM.SealedBox(combined: combined),
                   let plaintext = try? AES.GCM.open(sealedBox, using: symKey),

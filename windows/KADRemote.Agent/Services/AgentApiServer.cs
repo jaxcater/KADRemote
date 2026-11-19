@@ -75,11 +75,28 @@ public sealed class AgentApiServer : IAsyncDisposable
             KeepAliveInterval = TimeSpan.FromSeconds(20)
         });
 
-        app.MapGet("/api/health", () => Results.Ok(new HealthResponse("KADRemote", "1.1.0", "online", "headless-agent")));
+        app.MapGet("/api/health", () => Results.Ok(new HealthResponse("KADRemote", "1.3.0", "online", "headless-agent")));
+
+        app.MapPost("/api/agent/shutdown", (HttpContext ctx) =>
+        {
+            var remoteIp = ctx.Connection.RemoteIpAddress;
+            bool isLoopback = remoteIp != null && System.Net.IPAddress.IsLoopback(remoteIp);
+            if (!isLoopback && !IsAuthorized(ctx.Request))
+                return Results.Unauthorized();
+
+            AgentLog.Info("Lifecycle", "Received local shutdown request for self-upgrade/replacement.");
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(150);
+                _tunnel.Dispose();
+                Environment.Exit(0);
+            });
+            return Results.Ok(new OkResponse(true, "Shutting down"));
+        });
 
         app.Use(async (ctx, next) =>
         {
-            if (ctx.Request.Path == "/api/health")
+            if (ctx.Request.Path == "/api/health" || ctx.Request.Path == "/api/agent/shutdown")
             {
                 await next();
                 return;

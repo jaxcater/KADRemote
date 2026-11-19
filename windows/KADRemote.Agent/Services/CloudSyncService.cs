@@ -1,3 +1,4 @@
+using System.IO;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
@@ -8,8 +9,8 @@ namespace KADRemote.Agent.Services;
 
 /// <summary>
 /// Publishes an AES-256-GCM encrypted server announcement (containing Tunnel URL, LAN URLs, and stats)
-/// to a token-derived ntfy.sh topic so the iPhone app can automatically discover remote Windows Servers
-/// across 4G/Internet/NAT without requiring inbound connections to the iPhone.
+/// to a token-derived ntfy.sh topic AND listens for "KADREQ1:discover" requests from the iPhone app,
+/// so the iPhone on 4G/Internet discovers the Windows PC in real time within seconds.
 /// </summary>
 public sealed class CloudSyncService : IDisposable
 {
@@ -18,12 +19,14 @@ public sealed class CloudSyncService : IDisposable
     private readonly SystemService _system;
     private readonly CloudflareTunnelService _tunnel;
     private readonly HttpClient _http;
+    private readonly HttpClient _streamHttp;
     private readonly string _topic;
     private readonly byte[] _encKey;
     private readonly CancellationTokenSource _cts = new();
     private readonly SemaphoreSlim _wakeSignal = new(0, 1);
 
-    private Task? _loopTask;
+    private Task? _publishTask;
+    private Task? _listenTask;
 
     public CloudSyncService(AgentConfigService config, SystemService system, CloudflareTunnelService tunnel)
     {
@@ -37,7 +40,10 @@ public sealed class CloudSyncService : IDisposable
         _encKey = SHA256.HashData(Encoding.UTF8.GetBytes("kad-rendezvous-key-v1:" + token));
 
         _http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "KADRemote-Agent/1.1");
+        _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "KADRemote-Agent/1.3");
+
+        _streamHttp = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        _streamHttp.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "KADRemote-Agent/1.3");
 
         _tunnel.TunnelUrlChanged += OnTunnelUrlChanged;
     }
@@ -45,7 +51,8 @@ public sealed class CloudSyncService : IDisposable
     public void Start()
     {
         if (!_config.Config.EnableCloudSync) return;
-        _loopTask ??= Task.Run(() => RunLoopAsync(_cts.Token));
+        _publishTask ??= Task.Run(() => RunPublishLoopAsync(_cts.Token));
+        _listenTask ??= Task.Run(() => RunListenLoopAsync(_cts.Token));
     }
 
     private void OnTunnelUrlChanged(string? url)
@@ -64,16 +71,10 @@ public sealed class CloudSyncService : IDisposable
         catch { }
     }
 
-    private async Task RunLoopAsync(CancellationToken ct)
+    private async Task RunPublishLoopAsync(CancellationToken ct)
     {
-        // Give cloudflared a brief window (~8s) on startup so the very first cloud announcement
-        // already carries the Tunnel URL if available.
-        if (_config.Config.EnableCloudflareTunnel && string.IsNullOrWhiteSpace(_tunnel.PublicUrl))
-        {
-            try { await _wakeSignal.WaitAsync(8000, ct); }
-            catch (OperationCanceledException) { return; }
-        }
-
+        // Publish immediately on startup so the iPhone sees the PC right away,
+        // and publish again immediately as soon as cloudflared reports its Tunnel URL.
         int failCount = 0;
         while (!ct.IsCancellationRequested)
         {
@@ -81,19 +82,54 @@ public sealed class CloudSyncService : IDisposable
             failCount = ok ? 0 : failCount + 1;
 
             int waitMs = ok
-                ? 8 * 60 * 1000
-                : Math.Min(120_000, 10_000 * failCount);
+                ? (string.IsNullOrWhiteSpace(_tunnel.PublicUrl) && _config.Config.EnableCloudflareTunnel ? 15_000 : 5 * 60 * 1000)
+                : Math.Min(60_000, 5_000 * failCount);
 
             try
             {
                 await _wakeSignal.WaitAsync(waitMs, ct);
-                // Small coalesce delay in case multiple updates fire together
-                await Task.Delay(500, ct);
+                await Task.Delay(400, ct);
             }
             catch (OperationCanceledException)
             {
                 break;
             }
+        }
+    }
+
+    private async Task RunListenLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, $"{RelayEndpoint}/{_topic}/json");
+                using var resp = await _streamHttp.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+                resp.EnsureSuccessStatusCode();
+
+                await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+                using var reader = new StreamReader(stream, Encoding.UTF8);
+
+                while (!ct.IsCancellationRequested && await reader.ReadLineAsync(ct) is { } line)
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    if (!line.Contains("KADREQ1:discover", StringComparison.Ordinal)) continue;
+
+                    AgentLog.Info("CloudSync", "Received discover request from iPhone -> publishing fresh status");
+                    SignalWake();
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch
+            {
+                // Reconnect stream after brief backoff
+            }
+
+            try { await Task.Delay(5000, ct); }
+            catch (OperationCanceledException) { break; }
         }
     }
 
@@ -125,11 +161,12 @@ public sealed class CloudSyncService : IDisposable
                 Content = content
             };
             req.Headers.TryAddWithoutValidation("Title", "kad");
+            req.Headers.TryAddWithoutValidation("Cache", "yes");
 
             using var resp = await _http.SendAsync(req, ct);
             if (resp.IsSuccessStatusCode)
             {
-                AgentLog.Info("CloudSync", $"Published encrypted announcement (tunnel={!string.IsNullOrEmpty(dto.TunnelUrl)})");
+                AgentLog.Info("CloudSync", $"Published encrypted announcement (tunnel={dto.TunnelUrl ?? "pending"})");
                 return true;
             }
 
@@ -169,6 +206,7 @@ public sealed class CloudSyncService : IDisposable
         _tunnel.TunnelUrlChanged -= OnTunnelUrlChanged;
         _cts.Cancel();
         _http.Dispose();
+        _streamHttp.Dispose();
         _wakeSignal.Dispose();
         _cts.Dispose();
     }

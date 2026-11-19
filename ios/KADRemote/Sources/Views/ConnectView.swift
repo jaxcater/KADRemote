@@ -338,6 +338,11 @@ struct ConnectView: View {
             .task {
                 hub.ensureRunning()
                 await store.discoverAgents(includeSubnetScan: true)
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 4_000_000_000)
+                    if Task.isCancelled { break }
+                    await store.pollCloudAndUdpQuickly()
+                }
             }
             .sheet(isPresented: $showScanner) {
                 QRScannerView { raw in

@@ -9,7 +9,7 @@
     <AssemblyName>Kad</AssemblyName>
     <RootNamespace>KADRemote.Agent</RootNamespace>
     <ApplicationIcon>..\KADRemote.Host\Assets\kad.ico</ApplicationIcon>
-    <Version>1.1.0</Version>
+    <Version>1.3.0</Version>
     <Product>KAD Remote Agent</Product>
     <Company>KADRemote</Company>
     <Description>KAD Remote - Ultra-lightweight Headless Windows Server Agent</Description>

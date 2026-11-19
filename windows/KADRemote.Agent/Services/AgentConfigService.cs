@@ -101,30 +101,7 @@ public sealed class AgentConfigService
         {
             Directory.CreateDirectory(installDir);
 
-            // Stop any previously installed agent instance so we can replace KadAgent.exe cleanly
-            foreach (var procName in new[] { "KadAgent", "Kad" })
-            {
-                foreach (var proc in Process.GetProcessesByName(procName))
-                {
-                    try
-                    {
-                        if (proc.Id == Environment.ProcessId) continue;
-                        string? procPath = null;
-                        try { procPath = proc.MainModule?.FileName; } catch { }
-                        if (procPath == null) continue;
-
-                        var fullProc = Path.GetFullPath(procPath);
-                        if (string.Equals(fullProc, Path.GetFullPath(installedExe), StringComparison.OrdinalIgnoreCase)
-                            || string.Equals(fullProc, Path.GetFullPath(legacyInstalledExe), StringComparison.OrdinalIgnoreCase))
-                        {
-                            proc.Kill(entireProcessTree: true);
-                            proc.WaitForExit(3000);
-                        }
-                    }
-                    catch { }
-                    finally { proc.Dispose(); }
-                }
-            }
+            StopExistingAgentInstances(installedExe, legacyInstalledExe);
 
             // Copy with brief retry in case file handle is still releasing
             for (int attempt = 0; attempt < 6; attempt++)
@@ -164,6 +141,56 @@ public sealed class AgentConfigService
                 SaveConfigBackup();
             ApplyWindowsStartup(true, currentExe);
             return false;
+        }
+    }
+
+    public void StopExistingAgentInstances(string? installedExe = null, string? legacyInstalledExe = null)
+    {
+        var installDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "KADRemote"
+        );
+        installedExe ??= Path.Combine(installDir, "KadAgent.exe");
+        legacyInstalledExe ??= Path.Combine(installDir, "Kad.exe");
+
+        // 1. Ask any running local agent on AgentPort to shut down gracefully (works even across privilege levels!)
+        try
+        {
+            using var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromMilliseconds(900) };
+            using var resp = http.PostAsync($"http://127.0.0.1:{Config.AgentPort}/api/agent/shutdown", null).GetAwaiter().GetResult();
+            if (resp.IsSuccessStatusCode)
+                Thread.Sleep(400);
+        }
+        catch { }
+
+        // 2. Terminate remaining KadAgent / Kad processes running from LocalAppData\KADRemote
+        foreach (var procName in new[] { "KadAgent", "Kad" })
+        {
+            foreach (var proc in Process.GetProcessesByName(procName))
+            {
+                try
+                {
+                    if (proc.Id == Environment.ProcessId) continue;
+                    string? procPath = null;
+                    try { procPath = proc.MainModule?.FileName; } catch { }
+
+                    bool shouldKill = procName.Equals("KadAgent", StringComparison.OrdinalIgnoreCase);
+                    if (!shouldKill && procPath != null)
+                    {
+                        var fullProc = Path.GetFullPath(procPath);
+                        shouldKill = string.Equals(fullProc, Path.GetFullPath(installedExe), StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(fullProc, Path.GetFullPath(legacyInstalledExe), StringComparison.OrdinalIgnoreCase);
+                    }
+
+                    if (shouldKill)
+                    {
+                        proc.Kill(entireProcessTree: true);
+                        proc.WaitForExit(2500);
+                    }
+                }
+                catch { }
+                finally { proc.Dispose(); }
+            }
         }
     }
 
