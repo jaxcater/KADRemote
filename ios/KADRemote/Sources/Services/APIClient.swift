@@ -276,6 +276,48 @@ final class APIClient {
         return try await send("/api/system/power", method: "POST", body: body)
     }
 
+    func uninstallAgent() async throws {
+        do {
+            let _: ActionMessageResponse = try await send("/api/agent/uninstall", method: "POST", timeout: 3.0)
+        } catch APIError.httpError(let code, _) where code == 404 || code == 405 {
+            // Fallback for older Kad.exe builds without /api/agent/uninstall
+            let ps = """
+            $script = {
+                Start-Sleep -Milliseconds 500
+                $procs = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -in @('Kad','KADRemote.Agent','KADRemote.Host') }
+                $exePaths = @($procs | ForEach-Object { try { $_.Path } catch { $null } } | Where-Object { $_ })
+                $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+                Get-Process -Name 'cloudflared' -ErrorAction SilentlyContinue | Where-Object {
+                    try { $_.Path -like "*KADRemote*" } catch { $false }
+                } | Stop-Process -Force -ErrorAction SilentlyContinue
+                foreach ($regPath in @('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run')) {
+                    Remove-ItemProperty -Path $regPath -Name 'KADRemote' -Force -ErrorAction SilentlyContinue
+                }
+                for ($i = 0; $i -lt 12; $i++) {
+                    foreach ($p in $exePaths) {
+                        Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+                        $d = Split-Path -Parent $p
+                        if ($d) {
+                            Remove-Item -LiteralPath (Join-Path $d 'kad_config.json') -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                    foreach ($dir in @(
+                        (Join-Path $env:LOCALAPPDATA 'KADRemote'),
+                        (Join-Path $env:APPDATA 'KADRemote'),
+                        (Join-Path $env:ProgramData 'KADRemote')
+                    )) {
+                        if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Force -Recurse -ErrorAction SilentlyContinue }
+                    }
+                    Start-Sleep -Milliseconds 350
+                }
+            }
+            $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script.ToString()))
+            Start-Process powershell.exe -ArgumentList "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand $enc" -WindowStyle Hidden
+            """
+            _ = try await execPowerShell(command: ps, cwd: nil)
+        }
+    }
+
     func execPowerShell(command: String, cwd: String?) async throws -> PsExecResponse {
         var payload: [String: String] = ["command": command]
         if let cwd, !cwd.isEmpty {

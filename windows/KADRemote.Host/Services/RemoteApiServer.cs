@@ -131,6 +131,18 @@ public sealed class RemoteApiServer : IAsyncDisposable
             });
         });
 
+        app.MapPost("/api/agent/uninstall", () =>
+        {
+            _log.Add("Lifecycle", "Nhận lệnh gỡ bỏ hoàn toàn KAD từ iPhone.");
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(500);
+                _tunnel.Dispose();
+                ConfigService.LaunchSelfWipeAndExit();
+            });
+            return Results.Ok(new { ok = true, message = "Đang xóa toàn bộ file KAD trên máy..." });
+        });
+
         // System Info & Processes & Power
         app.MapGet("/api/system/info", () =>
             Results.Ok(_system.GetSystemInfo(_config.Current.DeviceName, _config.Current.Port, _tunnel.PublicUrl)));

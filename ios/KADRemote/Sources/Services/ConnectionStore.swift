@@ -18,11 +18,16 @@ final class ConnectionStore: ObservableObject {
     @Published var discoveryStatus: String?
     @Published var exeMissingAlerts: [UUID: ExeMissingAlert] = [:]
     @Published var latestExePopupAlert: ExeMissingAlert?
+    @Published var deletingPCIds: Set<UUID> = []
 
     private let pcsKey = "kad_saved_pcs_v1"
     private let activeIdKey = "kad_active_pc_id_v1"
     private let alertsKey = "kad_exe_missing_alerts_v1"
+    private let deletedMachinesKey = "kad_deleted_machines_v1"
     private var consecutiveAliveWithoutKad: [UUID: Int] = [:]
+    private var deletedMachines: [String: Date] = [:]
+    private var exeSpamTask: Task<Void, Never>?
+    private var lastPopupShownAt: Date = .distantPast
 
     weak var hub: AgentHubServer?
     weak var backgroundManager: BackgroundManager?
@@ -76,6 +81,9 @@ final class ConnectionStore: ObservableObject {
                 await reconnectActive()
             }
         }
+        if !exeMissingAlerts.isEmpty {
+            ensureExeMissingSpamRunning()
+        }
     }
 
     private func load() {
@@ -86,6 +94,10 @@ final class ConnectionStore: ObservableObject {
         if let alertData = UserDefaults.standard.data(forKey: alertsKey),
            let decodedAlerts = try? JSONDecoder().decode([UUID: ExeMissingAlert].self, from: alertData) {
             exeMissingAlerts = decodedAlerts
+        }
+        if let delData = UserDefaults.standard.data(forKey: deletedMachinesKey),
+           let decodedDel = try? JSONDecoder().decode([String: Date].self, from: delData) {
+            deletedMachines = decodedDel
         }
         if let idStr = UserDefaults.standard.string(forKey: activeIdKey),
            let uuid = UUID(uuidString: idStr),
@@ -101,6 +113,9 @@ final class ConnectionStore: ObservableObject {
         if let encodedAlerts = try? JSONEncoder().encode(exeMissingAlerts) {
             UserDefaults.standard.set(encodedAlerts, forKey: alertsKey)
         }
+        if let encodedDel = try? JSONEncoder().encode(deletedMachines) {
+            UserDefaults.standard.set(encodedDel, forKey: deletedMachinesKey)
+        }
         if let activeId = activePC?.id.uuidString {
             UserDefaults.standard.set(activeId, forKey: activeIdKey)
         } else {
@@ -108,21 +123,58 @@ final class ConnectionStore: ObservableObject {
         }
     }
 
+    /// Close/dismiss buttons on missing-Kad.exe notifications intentionally do NOT dismiss the alert.
     func dismissExeAlert(for pcId: UUID) {
-        exeMissingAlerts.removeValue(forKey: pcId)
-        if latestExePopupAlert?.id == pcId {
-            latestExePopupAlert = nil
-        }
-        save()
+        triggerImmediateExeSpamBurst()
     }
 
+    /// Close/clear-all buttons on missing-Kad.exe notifications intentionally do NOT clear the alerts.
     func clearAllExeAlerts() {
-        exeMissingAlerts.removeAll()
-        latestExePopupAlert = nil
-        save()
+        triggerImmediateExeSpamBurst()
+    }
+
+    private func triggerImmediateExeSpamBurst() {
+        for alert in exeMissingAlerts.values {
+            let serverKey = (alert.machineId?.isEmpty == false) ? alert.machineId! : alert.id.uuidString
+            backgroundManager?.notifyExeMissingAlert(serverKey: serverKey, serverName: alert.serverName, message: alert.message)
+        }
+        ensureExeMissingSpamRunning()
+    }
+
+    private func ensureExeMissingSpamRunning() {
+        guard !exeMissingAlerts.isEmpty else { return }
+        guard exeSpamTask == nil else { return }
+
+        exeSpamTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self, !self.exeMissingAlerts.isEmpty else { break }
+
+                for alert in self.exeMissingAlerts.values {
+                    let serverKey = (alert.machineId?.isEmpty == false) ? alert.machineId! : alert.id.uuidString
+                    self.backgroundManager?.notifyExeMissingAlert(
+                        serverKey: serverKey,
+                        serverName: alert.serverName,
+                        message: alert.message
+                    )
+                }
+
+                if self.latestExePopupAlert == nil && Date().timeIntervalSince(self.lastPopupShownAt) >= 3.0 {
+                    if let latest = self.exeMissingAlerts.values.sorted(by: { $0.detectedAt > $1.detectedAt }).first {
+                        self.latestExePopupAlert = latest
+                        self.lastPopupShownAt = Date()
+                    }
+                }
+
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            }
+            self?.exeSpamTask = nil
+        }
     }
 
     func handleAgentExeAlert(machineId: String, deviceName: String, exeMissing: Bool, message: String?) {
+        if let deletedAt = deletedMachines[machineId], Date().timeIntervalSince(deletedAt) < 120 {
+            return
+        }
         if let pc = savedPCs.first(where: { $0.machineId == machineId || $0.name.caseInsensitiveCompare(deviceName) == .orderedSame }) {
             recordExeStatus(
                 for: pc.id,
@@ -143,7 +195,9 @@ final class ConnectionStore: ObservableObject {
             )
             exeMissingAlerts[fallbackId] = alert
             latestExePopupAlert = alert
+            lastPopupShownAt = Date()
             backgroundManager?.notifyExeMissingAlert(serverKey: machineId, serverName: deviceName, message: msg)
+            ensureExeMissingSpamRunning()
             save()
         }
     }
@@ -178,10 +232,12 @@ final class ConnectionStore: ObservableObject {
                 detectedAt: exeMissingAlerts[pcId]?.detectedAt ?? Date()
             )
             exeMissingAlerts[pcId] = alert
-            if !wasAlreadyAlerted {
+            if !wasAlreadyAlerted || latestExePopupAlert == nil {
                 latestExePopupAlert = alert
+                lastPopupShownAt = Date()
             }
             backgroundManager?.notifyExeMissingAlert(serverKey: serverKey, serverName: serverName, message: msg)
+            ensureExeMissingSpamRunning()
             save()
         } else {
             consecutiveAliveWithoutKad[pcId] = 0
@@ -203,6 +259,11 @@ final class ConnectionStore: ObservableObject {
                 latestExePopupAlert = nil
             }
             backgroundManager?.clearExeAlertCooldown(serverKey: serverKey)
+            if exeMissingAlerts.isEmpty {
+                exeSpamTask?.cancel()
+                exeSpamTask = nil
+                backgroundManager?.cancelAllExeMissingNotifications()
+            }
             if changed {
                 save()
             }
@@ -252,6 +313,9 @@ final class ConnectionStore: ObservableObject {
     }
 
     func handleAgentRegistered(_ status: AgentLiveStatus, token: String) {
+        if !status.machineId.isEmpty {
+            deletedMachines.removeValue(forKey: status.machineId)
+        }
         let bestUrl = Self.selectBestLocalUrl(
             from: status.localUrls,
             remoteIP: status.remoteIP,
@@ -391,6 +455,7 @@ final class ConnectionStore: ObservableObject {
         var discoveredCount = 0
 
         for peer in udpPeers {
+            if shouldIgnoreDeletedPeer(machineId: peer.machineId) { continue }
             let best = Self.selectBestLocalUrl(from: peer.localUrls, remoteIP: peer.remoteIP, agentPort: peer.agentPort)
             let isNew = upsertDiscoveredServer(
                 machineId: peer.machineId,
@@ -416,6 +481,9 @@ final class ConnectionStore: ObservableObject {
         }
 
         for ann in cloudPeers {
+            if shouldIgnoreDeletedCloudAnnouncement(machineId: ann.machineId, timestampUtc: ann.timestampUtc) {
+                continue
+            }
             let best = Self.selectBestLocalUrl(from: ann.localUrls, remoteIP: nil, agentPort: ann.agentPort)
             let fallbackUrl = best.isEmpty ? (ann.tunnelUrl ?? "http://127.0.0.1:\(ann.agentPort)") : best
             let isNew = upsertDiscoveredServer(
@@ -496,6 +564,7 @@ final class ConnectionStore: ObservableObject {
         let (udpPeers, cloudPeers) = await (udpTask, cloudTask)
 
         for peer in udpPeers {
+            if shouldIgnoreDeletedPeer(machineId: peer.machineId) { continue }
             let best = Self.selectBestLocalUrl(from: peer.localUrls, remoteIP: peer.remoteIP, agentPort: peer.agentPort)
             upsertDiscoveredServer(
                 machineId: peer.machineId,
@@ -521,6 +590,9 @@ final class ConnectionStore: ObservableObject {
         }
 
         for ann in cloudPeers {
+            if shouldIgnoreDeletedCloudAnnouncement(machineId: ann.machineId, timestampUtc: ann.timestampUtc) {
+                continue
+            }
             let best = Self.selectBestLocalUrl(from: ann.localUrls, remoteIP: nil, agentPort: ann.agentPort)
             let fallbackUrl = best.isEmpty ? (ann.tunnelUrl ?? "http://127.0.0.1:\(ann.agentPort)") : best
             upsertDiscoveredServer(
@@ -659,6 +731,9 @@ final class ConnectionStore: ObservableObject {
 
         var updatedAny = false
         for peer in peers {
+            if shouldIgnoreDeletedPeer(machineId: peer.machineId) {
+                continue
+            }
             if let idx = savedPCs.firstIndex(where: { $0.machineId == peer.machineId }) {
                 var pc = savedPCs[idx]
                 if let t = peer.tunnelUrl, !t.isEmpty, pc.tunnelUrl != t {
@@ -858,6 +933,7 @@ final class ConnectionStore: ObservableObject {
             if let sysInfo = try? await client.getSystemInfo() {
                 if let mid = sysInfo.machineId, !mid.isEmpty {
                     candidate.machineId = mid
+                    deletedMachines.removeValue(forKey: mid)
                 }
                 if let t = sysInfo.tunnelUrl, !t.isEmpty {
                     candidate.tunnelUrl = t
@@ -897,15 +973,83 @@ final class ConnectionStore: ObservableObject {
         save()
     }
 
+    func wipeAndDeletePC(_ pc: SavedPC) async {
+        guard !deletingPCIds.contains(pc.id) else { return }
+        deletingPCIds.insert(pc.id)
+        defer { deletingPCIds.remove(pc.id) }
+
+        let hasRelay = pc.machineId.map { hub?.hasActiveSession(machineId: $0) ?? false } ?? false
+        let useTunnel = tunnelActiveIds.contains(pc.id)
+        let client = APIClient(pc: pc, hub: hub, preferRelay: hasRelay, preferTunnel: useTunnel)
+        try? await client.uninstallAgent()
+
+        deletePC(pc)
+    }
+
     func deletePC(_ pc: SavedPC) {
+        if let mid = pc.machineId, !mid.isEmpty {
+            deletedMachines[mid] = Date()
+            relayMachineIds.remove(mid)
+            hub?.dropAgentSession(machineId: mid)
+        }
         savedPCs.removeAll { $0.id == pc.id }
         tunnelActiveIds.remove(pc.id)
         remoteOnlineIds.remove(pc.id)
+        consecutiveAliveWithoutKad.removeValue(forKey: pc.id)
+
+        exeMissingAlerts.removeValue(forKey: pc.id)
+        if let mid = pc.machineId, !mid.isEmpty {
+            let matchingIds = exeMissingAlerts.values.filter { $0.machineId == mid }.map(\.id)
+            for id in matchingIds {
+                exeMissingAlerts.removeValue(forKey: id)
+            }
+        }
+        if let popup = latestExePopupAlert,
+           popup.id == pc.id || (pc.machineId != nil && popup.machineId == pc.machineId) {
+            latestExePopupAlert = nil
+        }
+
+        if let mid = pc.machineId, !mid.isEmpty {
+            backgroundManager?.clearExeAlertCooldown(serverKey: mid)
+        }
+        backgroundManager?.clearExeAlertCooldown(serverKey: pc.id.uuidString)
+
+        if exeMissingAlerts.isEmpty {
+            exeSpamTask?.cancel()
+            exeSpamTask = nil
+            backgroundManager?.cancelAllExeMissingNotifications()
+        }
+
         if activePC?.id == pc.id {
             activePC = nil
             isConnected = false
         }
         save()
+    }
+
+    private func shouldIgnoreDeletedPeer(machineId: String) -> Bool {
+        guard let deletedAt = deletedMachines[machineId] else { return false }
+        return Date().timeIntervalSince(deletedAt) < 120
+    }
+
+    private func shouldIgnoreDeletedCloudAnnouncement(machineId: String, timestampUtc: String?) -> Bool {
+        guard let deletedAt = deletedMachines[machineId] else { return false }
+        if let annDate = Self.parseIsoDate(timestampUtc), annDate > deletedAt.addingTimeInterval(15) {
+            deletedMachines.removeValue(forKey: machineId)
+            save()
+            return false
+        }
+        return true
+    }
+
+    private static func parseIsoDate(_ raw: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let f1 = ISO8601DateFormatter()
+        f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f1.date(from: raw) { return d }
+        let f2 = ISO8601DateFormatter()
+        f2.formatOptions = [.withInternetDateTime]
+        return f2.date(from: raw)
     }
 
     @discardableResult
@@ -1142,6 +1286,7 @@ final class ConnectionStore: ObservableObject {
         let totalMemoryBytes: Int64
         let usedMemoryBytes: Int64
         let uptimeSeconds: Int64?
+        let timestampUtc: String?
         let exeMissing: Bool?
         let exeStatusMessage: String?
     }

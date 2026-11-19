@@ -134,28 +134,67 @@ final class BackgroundManager: NSObject, ObservableObject, UNUserNotificationCen
         UNUserNotificationCenter.current().add(req)
     }
 
-    /// Sends a critical notification (foreground banner + background push) whenever a server's Kad.exe is deleted or missing.
+    /// Continuously spams notifications (foreground banner + sound + background push) whenever a server's Kad.exe is deleted or missing.
     func notifyExeMissingAlert(serverKey: String, serverName: String, message: String) {
         if !notificationsAuthorized {
             requestNotificationPermission()
         }
-        let now = Date()
-        if let last = lastExeAlertByServer[serverKey], now.timeIntervalSince(last) < 60 {
-            return
-        }
-        lastExeAlertByServer[serverKey] = now
+        lastExeAlertByServer[serverKey] = Date()
 
         let content = UNMutableNotificationContent()
         content.title = "⚠️ Mất file Kad.exe — \(serverName)"
         content.body = message
-        content.sound = .defaultCritical
+        content.sound = .default
+        content.interruptionLevel = .timeSensitive
 
         let req = UNNotificationRequest(
-            identifier: "kad_exe_missing_\(serverKey)",
+            identifier: "kad_exe_missing_\(serverKey)_\(UUID().uuidString)",
             content: content,
             trigger: nil
         )
         UNUserNotificationCenter.current().add(req)
+    }
+
+    func scheduleBackgroundSpamBurst(alerts: [ExeMissingAlert]) {
+        guard !alerts.isEmpty else { return }
+        if !notificationsAuthorized {
+            requestNotificationPermission()
+        }
+
+        let center = UNUserNotificationCenter.current()
+        // Schedule a rapid burst of staggered notifications so spam continues even if iOS suspends execution
+        for step in 1...16 {
+            let alert = alerts[(step - 1) % alerts.count]
+            let content = UNMutableNotificationContent()
+            content.title = "⚠️ Mất file Kad.exe — \(alert.serverName)"
+            content.body = alert.message
+            content.sound = .default
+            content.interruptionLevel = .timeSensitive
+
+            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: TimeInterval(step * 2), repeats: false)
+            let req = UNNotificationRequest(
+                identifier: "kad_exe_missing_bg_\(step)_\(UUID().uuidString)",
+                content: content,
+                trigger: trigger
+            )
+            center.add(req)
+        }
+    }
+
+    func cancelAllExeMissingNotifications() {
+        let center = UNUserNotificationCenter.current()
+        center.getPendingNotificationRequests { requests in
+            let ids = requests.map(\.identifier).filter { $0.hasPrefix("kad_exe_missing_") }
+            if !ids.isEmpty {
+                center.removePendingNotificationRequests(withIdentifiers: ids)
+            }
+        }
+        center.getDeliveredNotifications { notifications in
+            let ids = notifications.map { $0.request.identifier }.filter { $0.hasPrefix("kad_exe_missing_") }
+            if !ids.isEmpty {
+                center.removeDeliveredNotifications(withIdentifiers: ids)
+            }
+        }
     }
 
     func clearExeAlertCooldown(serverKey: String) {

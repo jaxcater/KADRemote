@@ -135,6 +135,20 @@ public sealed class AgentApiServer : IAsyncDisposable
             ));
         });
 
+        app.MapPost("/api/agent/uninstall", async () =>
+        {
+            _config.PrepareForUninstall();
+            try { await _peers.BroadcastUninstalledAsync(); } catch { }
+            AgentLog.Info("Lifecycle", "Received remote uninstall request. Wiping all KAD files...");
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(500);
+                _tunnel.Dispose();
+                _config.LaunchSelfWipeAndExit();
+            });
+            return Results.Ok(new OkResponse(true, "Đang xóa toàn bộ file KAD trên máy..."));
+        });
+
         app.MapGet("/api/peers", () => Results.Ok(_peers.GetPeers()));
 
         app.MapGet("/api/system/info", () =>

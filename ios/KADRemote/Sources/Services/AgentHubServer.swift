@@ -246,6 +246,14 @@ final class AgentHubServer: ObservableObject {
         return sessions[machineId] != nil
     }
 
+    func dropAgentSession(machineId: String?) {
+        guard let machineId, !machineId.isEmpty else { return }
+        onlineAgents.removeValue(forKey: machineId)
+        if let conn = sessions.removeValue(forKey: machineId) {
+            conn.cancel()
+        }
+    }
+
     private func startWebSocketListener() {
         guard let port = NWEndpoint.Port(rawValue: UInt16(hubPort)) else { return }
 

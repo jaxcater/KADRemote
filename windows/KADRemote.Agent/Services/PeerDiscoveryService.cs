@@ -133,6 +133,20 @@ public sealed class PeerDiscoveryService : IDisposable
                     continue;
                 }
 
+                if (type == "peer_uninstalled")
+                {
+                    var tokenHash = root.TryGetProperty("tokenHash", out var th) ? th.GetString() : null;
+                    var machineId = root.TryGetProperty("machineId", out var mid) ? mid.GetString() : null;
+                    if (string.Equals(tokenHash, _tokenHash, StringComparison.OrdinalIgnoreCase) &&
+                        !string.IsNullOrWhiteSpace(machineId))
+                    {
+                        _peers.TryRemove(machineId, out _);
+                        _deadAgentChecks.TryRemove(machineId, out _);
+                        SavePersistedPeers();
+                    }
+                    continue;
+                }
+
                 if (type != "peer_beacon") continue;
                 var pkt = JsonSerializer.Deserialize(res.Buffer, AgentJsonContext.Default.UdpPeerBeaconPacket);
                 if (pkt == null) continue;
@@ -308,8 +322,27 @@ public sealed class PeerDiscoveryService : IDisposable
         return JsonSerializer.SerializeToUtf8Bytes(pkt, AgentJsonContext.Default.UdpPeerBeaconPacket);
     }
 
+    public async Task BroadcastUninstalledAsync()
+    {
+        try
+        {
+            using var udp = new UdpClient();
+            udp.EnableBroadcast = true;
+            var safeMid = JsonEncodedText.Encode(_config.MachineId).Value;
+            var payload = $"{{\"type\":\"peer_uninstalled\",\"tokenHash\":\"{_tokenHash}\",\"machineId\":\"{safeMid}\"}}";
+            var bytes = Encoding.UTF8.GetBytes(payload);
+            foreach (var target in GetBroadcastTargets())
+            {
+                try { await udp.SendAsync(bytes, new IPEndPoint(target, _peerPort)); }
+                catch { }
+            }
+        }
+        catch { }
+    }
+
     private async Task SendBeaconAsync(CancellationToken ct)
     {
+        if (_config.IsUninstalling) return;
         try
         {
             using var udp = new UdpClient();

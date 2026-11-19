@@ -97,6 +97,8 @@ public sealed class CloudSyncService : IDisposable
         int failCount = 0;
         while (!ct.IsCancellationRequested)
         {
+            if (_config.IsUninstalling) break;
+
             while (_pendingPeerAlerts.TryDequeue(out var peerAlert))
             {
                 await PublishPeerAlertAsync(peerAlert, ct);
@@ -106,7 +108,9 @@ public sealed class CloudSyncService : IDisposable
             failCount = ok ? 0 : failCount + 1;
 
             int waitMs = ok
-                ? (string.IsNullOrWhiteSpace(_tunnel.PublicUrl) && _config.Config.EnableCloudflareTunnel ? 15_000 : 5 * 60 * 1000)
+                ? (_config.IsExeMissing
+                    ? 8_000
+                    : (string.IsNullOrWhiteSpace(_tunnel.PublicUrl) && _config.Config.EnableCloudflareTunnel ? 15_000 : 5 * 60 * 1000))
                 : Math.Min(60_000, 5_000 * failCount);
 
             try

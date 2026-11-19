@@ -340,12 +340,19 @@ struct ConnectView: View {
                                     }
 
                                     Button(role: .destructive) {
-                                        store.deletePC(pc)
+                                        Task { await store.wipeAndDeletePC(pc) }
                                     } label: {
-                                        Image(systemName: "trash")
-                                            .foregroundColor(.red.opacity(0.8))
-                                            .padding(.leading, 8)
+                                        if store.deletingPCIds.contains(pc.id) {
+                                            ProgressView()
+                                                .tint(.red)
+                                                .padding(.leading, 8)
+                                        } else {
+                                            Image(systemName: "trash")
+                                                .foregroundColor(.red.opacity(0.8))
+                                                .padding(.leading, 8)
+                                        }
                                     }
+                                    .disabled(store.deletingPCIds.contains(pc.id))
                                 }
                                 .padding()
                                 .background(Color(.secondarySystemBackground))
