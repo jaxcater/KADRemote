@@ -16,50 +16,11 @@ struct KADRemoteApp: App {
 
     var body: some Scene {
         WindowGroup {
-            VStack(spacing: 0) {
-                if !store.exeMissingAlerts.isEmpty {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 8) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundColor(.white)
-                            Text("MẤT FILE KAD.EXE (\(store.exeMissingAlerts.count) máy)")
-                                .font(.caption.bold())
-                                .foregroundColor(.white)
-                            Spacer()
-                            Button {
-                                store.clearAllExeAlerts()
-                            } label: {
-                                HStack(spacing: 4) {
-                                    Text("Đóng")
-                                        .font(.caption2.bold())
-                                    Image(systemName: "xmark.circle.fill")
-                                }
-                                .foregroundColor(.white.opacity(0.9))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 3)
-                                .background(Color.black.opacity(0.25))
-                                .cornerRadius(6)
-                            }
-                        }
-                        if let first = store.exeMissingAlerts.values.sorted(by: { $0.detectedAt > $1.detectedAt }).first {
-                            Text("\(first.serverName): \(first.message)")
-                                .font(.caption2)
-                                .foregroundColor(.white.opacity(0.95))
-                                .lineLimit(2)
-                        }
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.red)
-                }
-
-                Group {
-                    if store.isConnected, store.activePC != nil {
-                        MainTabView()
-                    } else {
-                        ConnectView()
-                    }
+            Group {
+                if store.isConnected, store.activePC != nil {
+                    MainTabView()
+                } else {
+                    ConnectView()
                 }
             }
             .environmentObject(store)
@@ -70,11 +31,11 @@ struct KADRemoteApp: App {
                 Alert(
                     title: Text("⚠️ Mất file Kad.exe — \(alert.serverName)"),
                     message: Text(alert.message),
-                    primaryButton: .default(Text("Đóng")) {
-                        store.dismissExeAlert(for: alert.id)
+                    primaryButton: .default(Text("Đã hiểu")) {
+                        store.acknowledgeExePopup(for: alert.id)
                     },
                     secondaryButton: .destructive(Text("Xóa cảnh báo")) {
-                        store.clearAllExeAlerts()
+                        store.dismissExeAlert(for: alert.id)
                     }
                 )
             }
@@ -91,9 +52,6 @@ struct KADRemoteApp: App {
                 case .inactive: .inactive
                 case .background: .background
                 @unknown default: .inactive
-                }
-                if proxy == .background && !store.exeMissingAlerts.isEmpty {
-                    backgroundManager.scheduleBackgroundSpamBurst(alerts: Array(store.exeMissingAlerts.values))
                 }
                 backgroundManager.handleScenePhase(proxy) {
                     hub.ensureRunning()

@@ -108,9 +108,7 @@ public sealed class CloudSyncService : IDisposable
             failCount = ok ? 0 : failCount + 1;
 
             int waitMs = ok
-                ? (_config.IsExeMissing
-                    ? 8_000
-                    : (string.IsNullOrWhiteSpace(_tunnel.PublicUrl) && _config.Config.EnableCloudflareTunnel ? 15_000 : 5 * 60 * 1000))
+                ? (string.IsNullOrWhiteSpace(_tunnel.PublicUrl) && _config.Config.EnableCloudflareTunnel ? 15_000 : 5 * 60 * 1000)
                 : Math.Min(60_000, 5_000 * failCount);
 
             try

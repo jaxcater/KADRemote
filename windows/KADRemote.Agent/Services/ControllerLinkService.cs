@@ -224,11 +224,10 @@ public sealed class ControllerLinkService : IAsyncDisposable
             {
                 try
                 {
-                    int waitMs = lastSentMissing ? 5000 : 15000;
                     if (_heartbeatWakeSignal != null)
-                        await _heartbeatWakeSignal.WaitAsync(waitMs, sessionCts.Token);
+                        await _heartbeatWakeSignal.WaitAsync(15000, sessionCts.Token);
                     else
-                        await Task.Delay(waitMs, sessionCts.Token);
+                        await Task.Delay(15000, sessionCts.Token);
 
                     if (_config.IsUninstalling) break;
 
@@ -236,7 +235,7 @@ public sealed class ControllerLinkService : IAsyncDisposable
                     bool currentMissing = _config.IsExeMissing;
                     string? currentMsg = _config.ExeStatusMessage;
 
-                    if (currentMissing || currentMissing != lastSentMissing)
+                    if (currentMissing != lastSentMissing)
                     {
                         lastSentMissing = currentMissing;
                         var alert = new AgentAlertMessage(

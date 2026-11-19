@@ -24,10 +24,12 @@ final class ConnectionStore: ObservableObject {
     private let activeIdKey = "kad_active_pc_id_v1"
     private let alertsKey = "kad_exe_missing_alerts_v1"
     private let deletedMachinesKey = "kad_deleted_machines_v1"
+    private let dismissedAlertsKey = "kad_dismissed_exe_alerts_v1"
+    private let ackPopupsKey = "kad_ack_exe_popups_v1"
     private var consecutiveAliveWithoutKad: [UUID: Int] = [:]
     private var deletedMachines: [String: Date] = [:]
-    private var exeSpamTask: Task<Void, Never>?
-    private var lastPopupShownAt: Date = .distantPast
+    private var dismissedExeAlertKeys: Set<String> = []
+    private var acknowledgedPopupKeys: Set<String> = []
 
     weak var hub: AgentHubServer?
     weak var backgroundManager: BackgroundManager?
@@ -81,9 +83,6 @@ final class ConnectionStore: ObservableObject {
                 await reconnectActive()
             }
         }
-        if !exeMissingAlerts.isEmpty {
-            ensureExeMissingSpamRunning()
-        }
     }
 
     private func load() {
@@ -98,6 +97,12 @@ final class ConnectionStore: ObservableObject {
         if let delData = UserDefaults.standard.data(forKey: deletedMachinesKey),
            let decodedDel = try? JSONDecoder().decode([String: Date].self, from: delData) {
             deletedMachines = decodedDel
+        }
+        if let dismissedArr = UserDefaults.standard.stringArray(forKey: dismissedAlertsKey) {
+            dismissedExeAlertKeys = Set(dismissedArr)
+        }
+        if let ackArr = UserDefaults.standard.stringArray(forKey: ackPopupsKey) {
+            acknowledgedPopupKeys = Set(ackArr)
         }
         if let idStr = UserDefaults.standard.string(forKey: activeIdKey),
            let uuid = UUID(uuidString: idStr),
@@ -116,6 +121,8 @@ final class ConnectionStore: ObservableObject {
         if let encodedDel = try? JSONEncoder().encode(deletedMachines) {
             UserDefaults.standard.set(encodedDel, forKey: deletedMachinesKey)
         }
+        UserDefaults.standard.set(Array(dismissedExeAlertKeys), forKey: dismissedAlertsKey)
+        UserDefaults.standard.set(Array(acknowledgedPopupKeys), forKey: ackPopupsKey)
         if let activeId = activePC?.id.uuidString {
             UserDefaults.standard.set(activeId, forKey: activeIdKey)
         } else {
@@ -123,52 +130,63 @@ final class ConnectionStore: ObservableObject {
         }
     }
 
-    /// Close/dismiss buttons on missing-Kad.exe notifications intentionally do NOT dismiss the alert.
+    private func alertKeys(for pcId: UUID, machineId: String?) -> [String] {
+        var keys = [pcId.uuidString]
+        if let mid = machineId, !mid.isEmpty {
+            keys.append(mid)
+        }
+        return keys
+    }
+
+    func acknowledgeExePopup(for pcId: UUID) {
+        let machineId = exeMissingAlerts[pcId]?.machineId ?? savedPCs.first(where: { $0.id == pcId })?.machineId
+        for k in alertKeys(for: pcId, machineId: machineId) {
+            acknowledgedPopupKeys.insert(k)
+            backgroundManager?.cancelExeMissingNotification(serverKey: k)
+        }
+        if latestExePopupAlert?.id == pcId {
+            latestExePopupAlert = nil
+        }
+        save()
+    }
+
     func dismissExeAlert(for pcId: UUID) {
-        triggerImmediateExeSpamBurst()
-    }
-
-    /// Close/clear-all buttons on missing-Kad.exe notifications intentionally do NOT clear the alerts.
-    func clearAllExeAlerts() {
-        triggerImmediateExeSpamBurst()
-    }
-
-    private func triggerImmediateExeSpamBurst() {
-        for alert in exeMissingAlerts.values {
-            let serverKey = (alert.machineId?.isEmpty == false) ? alert.machineId! : alert.id.uuidString
-            backgroundManager?.notifyExeMissingAlert(serverKey: serverKey, serverName: alert.serverName, message: alert.message)
+        let machineId = exeMissingAlerts[pcId]?.machineId ?? savedPCs.first(where: { $0.id == pcId })?.machineId
+        for k in alertKeys(for: pcId, machineId: machineId) {
+            dismissedExeAlertKeys.insert(k)
+            acknowledgedPopupKeys.insert(k)
+            backgroundManager?.cancelExeMissingNotification(serverKey: k)
         }
-        ensureExeMissingSpamRunning()
-    }
-
-    private func ensureExeMissingSpamRunning() {
-        guard !exeMissingAlerts.isEmpty else { return }
-        guard exeSpamTask == nil else { return }
-
-        exeSpamTask = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                guard let self, !self.exeMissingAlerts.isEmpty else { break }
-
-                for alert in self.exeMissingAlerts.values {
-                    let serverKey = (alert.machineId?.isEmpty == false) ? alert.machineId! : alert.id.uuidString
-                    self.backgroundManager?.notifyExeMissingAlert(
-                        serverKey: serverKey,
-                        serverName: alert.serverName,
-                        message: alert.message
-                    )
-                }
-
-                if self.latestExePopupAlert == nil && Date().timeIntervalSince(self.lastPopupShownAt) >= 3.0 {
-                    if let latest = self.exeMissingAlerts.values.sorted(by: { $0.detectedAt > $1.detectedAt }).first {
-                        self.latestExePopupAlert = latest
-                        self.lastPopupShownAt = Date()
-                    }
-                }
-
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
+        exeMissingAlerts.removeValue(forKey: pcId)
+        if let mid = machineId, !mid.isEmpty {
+            let matchingIds = exeMissingAlerts.values.filter { $0.machineId == mid }.map(\.id)
+            for id in matchingIds {
+                exeMissingAlerts.removeValue(forKey: id)
             }
-            self?.exeSpamTask = nil
         }
+        if latestExePopupAlert?.id == pcId || (machineId != nil && latestExePopupAlert?.machineId == machineId) {
+            latestExePopupAlert = nil
+        }
+        save()
+    }
+
+    func clearAllExeAlerts() {
+        for alert in exeMissingAlerts.values {
+            for k in alertKeys(for: alert.id, machineId: alert.machineId) {
+                dismissedExeAlertKeys.insert(k)
+                acknowledgedPopupKeys.insert(k)
+            }
+        }
+        for pc in savedPCs where pc.exeMissing == true {
+            for k in alertKeys(for: pc.id, machineId: pc.machineId) {
+                dismissedExeAlertKeys.insert(k)
+                acknowledgedPopupKeys.insert(k)
+            }
+        }
+        exeMissingAlerts.removeAll()
+        latestExePopupAlert = nil
+        backgroundManager?.cancelAllExeMissingNotifications()
+        save()
     }
 
     func handleAgentExeAlert(machineId: String, deviceName: String, exeMissing: Bool, message: String?) {
@@ -184,6 +202,12 @@ final class ConnectionStore: ObservableObject {
                 message: message
             )
         } else if exeMissing {
+            if dismissedExeAlertKeys.contains(machineId) {
+                return
+            }
+            if exeMissingAlerts.values.contains(where: { $0.machineId == machineId }) {
+                return
+            }
             let fallbackId = UUID()
             let msg = message ?? "CẢNH BÁO: File Kad.exe trên máy \(deviceName) đã bị mất hoặc bị Windows xóa!"
             let alert = ExeMissingAlert(
@@ -194,10 +218,10 @@ final class ConnectionStore: ObservableObject {
                 detectedAt: Date()
             )
             exeMissingAlerts[fallbackId] = alert
-            latestExePopupAlert = alert
-            lastPopupShownAt = Date()
-            backgroundManager?.notifyExeMissingAlert(serverKey: machineId, serverName: deviceName, message: msg)
-            ensureExeMissingSpamRunning()
+            if !acknowledgedPopupKeys.contains(machineId) {
+                latestExePopupAlert = alert
+                backgroundManager?.notifyExeMissingAlert(serverKey: machineId, serverName: deviceName, message: msg)
+            }
             save()
         }
     }
@@ -209,19 +233,30 @@ final class ConnectionStore: ObservableObject {
         exeMissing: Bool,
         message: String?
     ) {
+        let keys = alertKeys(for: pcId, machineId: machineId)
         let serverKey = (machineId?.isEmpty == false) ? machineId! : pcId.uuidString
         if exeMissing {
             let msg = (message?.isEmpty == false)
                 ? message!
                 : "CẢNH BÁO: File Kad.exe trên máy \(serverName) đã bị mất hoặc bị Windows xóa!"
             let wasAlreadyAlerted = exeMissingAlerts[pcId] != nil
+            var changed = false
 
             if let idx = savedPCs.firstIndex(where: { $0.id == pcId }) {
-                savedPCs[idx].exeMissing = true
-                savedPCs[idx].exeStatusMessage = msg
-                if activePC?.id == pcId {
-                    activePC = savedPCs[idx]
+                if savedPCs[idx].exeMissing != true || savedPCs[idx].exeStatusMessage != msg {
+                    savedPCs[idx].exeMissing = true
+                    savedPCs[idx].exeStatusMessage = msg
+                    if activePC?.id == pcId {
+                        activePC = savedPCs[idx]
+                    }
+                    changed = true
                 }
+            }
+
+            let isDismissed = keys.contains { dismissedExeAlertKeys.contains($0) }
+            if isDismissed {
+                if changed { save() }
+                return
             }
 
             let alert = ExeMissingAlert(
@@ -231,17 +266,28 @@ final class ConnectionStore: ObservableObject {
                 message: msg,
                 detectedAt: exeMissingAlerts[pcId]?.detectedAt ?? Date()
             )
-            exeMissingAlerts[pcId] = alert
-            if !wasAlreadyAlerted || latestExePopupAlert == nil {
-                latestExePopupAlert = alert
-                lastPopupShownAt = Date()
+            if exeMissingAlerts[pcId] != alert {
+                exeMissingAlerts[pcId] = alert
+                changed = true
             }
-            backgroundManager?.notifyExeMissingAlert(serverKey: serverKey, serverName: serverName, message: msg)
-            ensureExeMissingSpamRunning()
-            save()
+
+            let isPopupAck = keys.contains { acknowledgedPopupKeys.contains($0) }
+            if !wasAlreadyAlerted && !isPopupAck {
+                latestExePopupAlert = alert
+                backgroundManager?.notifyExeMissingAlert(serverKey: serverKey, serverName: serverName, message: msg)
+            }
+
+            if changed {
+                save()
+            }
         } else {
             consecutiveAliveWithoutKad[pcId] = 0
             var changed = false
+            for k in keys {
+                if dismissedExeAlertKeys.remove(k) != nil { changed = true }
+                if acknowledgedPopupKeys.remove(k) != nil { changed = true }
+                backgroundManager?.clearExeAlertCooldown(serverKey: k)
+            }
             if let idx = savedPCs.firstIndex(where: { $0.id == pcId }) {
                 if savedPCs[idx].exeMissing == true || savedPCs[idx].exeStatusMessage != nil {
                     savedPCs[idx].exeMissing = false
@@ -258,10 +304,7 @@ final class ConnectionStore: ObservableObject {
             if latestExePopupAlert?.id == pcId {
                 latestExePopupAlert = nil
             }
-            backgroundManager?.clearExeAlertCooldown(serverKey: serverKey)
             if exeMissingAlerts.isEmpty {
-                exeSpamTask?.cancel()
-                exeSpamTask = nil
                 backgroundManager?.cancelAllExeMissingNotifications()
             }
             if changed {
@@ -1011,12 +1054,14 @@ final class ConnectionStore: ObservableObject {
 
         if let mid = pc.machineId, !mid.isEmpty {
             backgroundManager?.clearExeAlertCooldown(serverKey: mid)
+            dismissedExeAlertKeys.remove(mid)
+            acknowledgedPopupKeys.remove(mid)
         }
         backgroundManager?.clearExeAlertCooldown(serverKey: pc.id.uuidString)
+        dismissedExeAlertKeys.remove(pc.id.uuidString)
+        acknowledgedPopupKeys.remove(pc.id.uuidString)
 
         if exeMissingAlerts.isEmpty {
-            exeSpamTask?.cancel()
-            exeSpamTask = nil
             backgroundManager?.cancelAllExeMissingNotifications()
         }
 
