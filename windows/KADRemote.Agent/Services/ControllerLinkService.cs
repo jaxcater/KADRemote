@@ -45,9 +45,17 @@ public sealed class ControllerLinkService : IAsyncDisposable
         NetworkChange.NetworkAddressChanged += OnNetworkChanged;
         NetworkChange.NetworkAvailabilityChanged += OnNetworkAvailabilityChanged;
         _tunnel.TunnelUrlChanged += OnTunnelUrlChanged;
+        _config.ExeStatusChanged += OnExeStatusChanged;
     }
 
-    private void OnTunnelUrlChanged(string? _)
+    private void OnExeStatusChanged(bool missing, string? message)
+    {
+        WakeHeartbeat();
+    }
+
+    private void OnTunnelUrlChanged(string? _) => WakeHeartbeat();
+
+    private void WakeHeartbeat()
     {
         try
         {
@@ -201,7 +209,9 @@ public sealed class ControllerLinkService : IAsyncDisposable
             CpuUsagePercent: _system.GetCpuUsagePercent(),
             TotalMemoryBytes: totalMem,
             UsedMemoryBytes: usedMem,
-            UptimeSeconds: Environment.TickCount64 / 1000
+            UptimeSeconds: Environment.TickCount64 / 1000,
+            ExeMissing: _config.IsExeMissing,
+            ExeStatusMessage: _config.ExeStatusMessage
         );
         await SendTypedAsync(reg, AgentJsonContext.Default.AgentRegisterMessage, ct);
 
@@ -209,6 +219,7 @@ public sealed class ControllerLinkService : IAsyncDisposable
 
         var hbTask = Task.Run(async () =>
         {
+            bool lastSentMissing = _config.IsExeMissing;
             while (!sessionCts.IsCancellationRequested && ws.State == WebSocketState.Open)
             {
                 try
@@ -217,6 +228,26 @@ public sealed class ControllerLinkService : IAsyncDisposable
                         await _heartbeatWakeSignal.WaitAsync(15000, sessionCts.Token);
                     else
                         await Task.Delay(15000, sessionCts.Token);
+
+                    _config.CheckExeHealthNow();
+                    bool currentMissing = _config.IsExeMissing;
+                    string? currentMsg = _config.ExeStatusMessage;
+
+                    if (currentMissing != lastSentMissing)
+                    {
+                        lastSentMissing = currentMissing;
+                        var alert = new AgentAlertMessage(
+                            Type: "agent_alert",
+                            AlertType: "exe_missing",
+                            MachineId: _config.MachineId,
+                            DeviceName: _config.DeviceName,
+                            ExeMissing: currentMissing,
+                            Message: currentMsg ?? $"File Kad.exe trên máy {_config.DeviceName} đã được khôi phục.",
+                            ExePath: _config.PrimaryExePath,
+                            TimestampUtc: DateTimeOffset.UtcNow
+                        );
+                        await SendTypedAsync(alert, AgentJsonContext.Default.AgentAlertMessage, sessionCts.Token);
+                    }
 
                     var (tot, used) = _system.GetMemoryBytes();
                     var hb = new AgentHeartbeatMessage(
@@ -227,7 +258,9 @@ public sealed class ControllerLinkService : IAsyncDisposable
                         CpuUsagePercent: _system.GetCpuUsagePercent(),
                         TotalMemoryBytes: tot,
                         UsedMemoryBytes: used,
-                        UptimeSeconds: Environment.TickCount64 / 1000
+                        UptimeSeconds: Environment.TickCount64 / 1000,
+                        ExeMissing: currentMissing,
+                        ExeStatusMessage: currentMsg
                     );
                     await SendTypedAsync(hb, AgentJsonContext.Default.AgentHeartbeatMessage, sessionCts.Token);
                 }
@@ -483,6 +516,7 @@ public sealed class ControllerLinkService : IAsyncDisposable
         NetworkChange.NetworkAddressChanged -= OnNetworkChanged;
         NetworkChange.NetworkAvailabilityChanged -= OnNetworkAvailabilityChanged;
         _tunnel.TunnelUrlChanged -= OnTunnelUrlChanged;
+        _config.ExeStatusChanged -= OnExeStatusChanged;
         _cts.Cancel();
         if (_loopTask != null)
         {

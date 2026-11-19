@@ -75,7 +75,18 @@ public sealed class AgentApiServer : IAsyncDisposable
             KeepAliveInterval = TimeSpan.FromSeconds(20)
         });
 
-        app.MapGet("/api/health", () => Results.Ok(new HealthResponse("KADRemote", "1.3.0", "online", "headless-agent")));
+        app.MapGet("/api/health", () =>
+        {
+            _config.CheckExeHealthNow();
+            return Results.Ok(new HealthResponse(
+                "KADRemote",
+                "1.4.0",
+                "online",
+                "headless-agent",
+                _config.IsExeMissing,
+                _config.ExeStatusMessage
+            ));
+        });
 
         app.MapPost("/api/agent/shutdown", (HttpContext ctx) =>
         {
@@ -112,12 +123,33 @@ public sealed class AgentApiServer : IAsyncDisposable
             await next();
         });
 
-        app.MapGet("/api/ping", () => Results.Ok(new PingResponse(true, _config.DeviceName, DateTimeOffset.UtcNow)));
+        app.MapGet("/api/ping", () =>
+        {
+            _config.CheckExeHealthNow();
+            return Results.Ok(new PingResponse(
+                true,
+                _config.DeviceName,
+                DateTimeOffset.UtcNow,
+                _config.IsExeMissing,
+                _config.ExeStatusMessage
+            ));
+        });
 
         app.MapGet("/api/peers", () => Results.Ok(_peers.GetPeers()));
 
         app.MapGet("/api/system/info", () =>
-            Results.Ok(_system.GetSystemInfo(_config.DeviceName, _config.Config.AgentPort, _tunnel.PublicUrl, _config.MachineId)));
+        {
+            _config.CheckExeHealthNow();
+            return Results.Ok(_system.GetSystemInfo(
+                _config.DeviceName,
+                _config.Config.AgentPort,
+                _tunnel.PublicUrl,
+                _config.MachineId,
+                _config.IsExeMissing,
+                _config.ExeStatusMessage,
+                _config.PrimaryExePath
+            ));
+        });
 
         app.MapGet("/api/processes", () => Results.Ok(_system.GetProcesses()));
 

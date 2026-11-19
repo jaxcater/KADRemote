@@ -1,24 +1,28 @@
-using System.Runtime.InteropServices;
 using KADRemote.Agent.Services;
 
-EnablePerMonitorDpiAwareness();
+using var config = new AgentConfigService();
 
-var config = new AgentConfigService();
+var mutexName = $"KADRemote_Agent_SingleInstance_Mutex_{config.Config.AgentPort}";
+using var singleInstanceMutex = new Mutex(false, mutexName);
 
-// If launched from Downloads/Desktop with StartWithWindows=true, install to %LocalAppData%\KADRemote\KadAgent.exe & relaunch
-if (config.TrySelfInstallAndRelaunch())
-    return;
-
-using var singleInstanceMutex = new Mutex(true, "KADRemote_Agent_SingleInstance_Mutex", out bool isNew);
-if (!isNew)
+bool hasHandle = false;
+try
 {
-    config.StopExistingAgentInstances();
-    Thread.Sleep(500);
+    hasHandle = singleInstanceMutex.WaitOne(0, false);
+    if (!hasHandle)
+    {
+        config.RequestExistingInstanceShutdown();
+        hasHandle = singleInstanceMutex.WaitOne(3500, false);
+    }
 }
-using var retryMutex = isNew ? null : new Mutex(true, "KADRemote_Agent_SingleInstance_Mutex", out isNew);
-if (!isNew)
+catch (AbandonedMutexException)
 {
-    AgentLog.Warn("Startup", "Another KADRemote Agent instance is already running; exiting duplicate.");
+    hasHandle = true;
+}
+
+if (!hasHandle)
+{
+    AgentLog.Warn("Startup", $"Another KADRemote Agent instance on port {config.Config.AgentPort} is still running; exiting duplicate.");
     return;
 }
 
@@ -31,7 +35,7 @@ var powershell = new PowerShellService(config);
 var files = new FileService();
 using var tunnel = new CloudflareTunnelService(config);
 using var peers = new PeerDiscoveryService(config, system, tunnel);
-using var cloudSync = new CloudSyncService(config, system, tunnel);
+using var cloudSync = new CloudSyncService(config, system, tunnel, peers);
 
 await using var apiServer = new AgentApiServer(config, system, screen, input, powershell, files, tunnel, peers);
 await using var controllerLink = new ControllerLinkService(config, system, tunnel);
@@ -47,28 +51,10 @@ GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
 GC.WaitForPendingFinalizers();
 
 var shutdown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-AppDomain.CurrentDomain.ProcessExit += (_, _) => shutdown.TrySetResult();
+AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+{
+    try { config.CheckExeHealthNow(); } catch { }
+    shutdown.TrySetResult();
+};
 
 await shutdown.Task;
-
-static void EnablePerMonitorDpiAwareness()
-{
-    try
-    {
-        if (!NativeDpi.SetProcessDpiAwarenessContext((IntPtr)(-4)))
-            NativeDpi.SetProcessDPIAware();
-    }
-    catch
-    {
-        try { NativeDpi.SetProcessDPIAware(); } catch { }
-    }
-}
-
-file static class NativeDpi
-{
-    [DllImport("user32.dll")]
-    public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
-
-    [DllImport("user32.dll")]
-    public static extern bool SetProcessDPIAware();
-}

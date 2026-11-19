@@ -34,17 +34,18 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 $__kadCode = $LASTEXITCODE
 Write-Output ""{marker}$((Get-Location).Path)""
 if ($null -ne $__kadCode -and $__kadCode -ne 0) {{ exit $__kadCode }}
+exit 0
 ";
-
-        var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
 
         var psi = new ProcessStartInfo
         {
             FileName = "powershell.exe",
-            Arguments = $"-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}",
+            Arguments = "-NoLogo -NoProfile -NonInteractive -Command -",
             WorkingDirectory = cwd,
+            RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            StandardInputEncoding = new UTF8Encoding(false),
             StandardOutputEncoding = Encoding.UTF8,
             StandardErrorEncoding = Encoding.UTF8,
             UseShellExecute = false,
@@ -56,6 +57,10 @@ if ($null -ne $__kadCode -and $__kadCode -ne 0) {{ exit $__kadCode }}
         var stderrSb = new StringBuilder();
 
         proc.Start();
+
+        await proc.StandardInput.WriteAsync(script);
+        await proc.StandardInput.FlushAsync();
+        proc.StandardInput.Close();
 
         var outTask = Task.Run(async () =>
         {
@@ -139,7 +144,7 @@ if ($null -ne $__kadCode -and $__kadCode -ne 0) {{ exit $__kadCode }}
             var psi = new ProcessStartInfo
             {
                 FileName = "powershell.exe",
-                Arguments = "-NoLogo -NoExit -ExecutionPolicy Bypass -Command -",
+                Arguments = "-NoLogo -NoExit -Command -",
                 WorkingDirectory = _config.DefaultShellDirectory,
                 RedirectStandardInput = true,
                 RedirectStandardOutput = true,

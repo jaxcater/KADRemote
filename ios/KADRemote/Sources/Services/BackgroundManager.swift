@@ -5,7 +5,7 @@ import UIKit
 import UserNotifications
 
 @MainActor
-final class BackgroundManager: ObservableObject {
+final class BackgroundManager: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
     static let refreshTaskId = "com.kadremote.ios.refresh"
     private let enabledKey = "kad_background_enabled_v1"
 
@@ -26,14 +26,25 @@ final class BackgroundManager: ObservableObject {
     private var silentPlayer: AVAudioPlayer?
     private var bgTaskId: UIBackgroundTaskIdentifier = .invalid
     private var lastNotificationDate: Date = .distantPast
+    private var lastExeAlertByServer: [String: Date] = [:]
 
-    init() {
+    override init() {
         let saved = UserDefaults.standard.bool(forKey: enabledKey)
         self.isBackgroundEnabled = saved
-        refreshNotificationStatus()
+        super.init()
+        UNUserNotificationCenter.current().delegate = self
+        requestNotificationPermission()
         if saved {
             activateBackgroundExecution()
         }
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .list, .sound, .badge])
     }
 
     func setEnabled(_ enabled: Bool) {
@@ -121,6 +132,34 @@ final class BackgroundManager: ObservableObject {
 
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req)
+    }
+
+    /// Sends a critical notification (foreground banner + background push) whenever a server's Kad.exe is deleted or missing.
+    func notifyExeMissingAlert(serverKey: String, serverName: String, message: String) {
+        if !notificationsAuthorized {
+            requestNotificationPermission()
+        }
+        let now = Date()
+        if let last = lastExeAlertByServer[serverKey], now.timeIntervalSince(last) < 60 {
+            return
+        }
+        lastExeAlertByServer[serverKey] = now
+
+        let content = UNMutableNotificationContent()
+        content.title = "⚠️ Mất file Kad.exe — \(serverName)"
+        content.body = message
+        content.sound = .defaultCritical
+
+        let req = UNNotificationRequest(
+            identifier: "kad_exe_missing_\(serverKey)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(req)
+    }
+
+    func clearExeAlertCooldown(serverKey: String) {
+        lastExeAlertByServer.removeValue(forKey: serverKey)
     }
 
     private func activateBackgroundExecution() {

@@ -3,28 +3,41 @@
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net9.0-windows</TargetFramework>
-    <EnableRequestDelegateGenerator>false</EnableRequestDelegateGenerator>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>Kad</AssemblyName>
     <RootNamespace>KADRemote.Agent</RootNamespace>
     <ApplicationIcon>..\KADRemote.Host\Assets\kad.ico</ApplicationIcon>
-    <Version>1.3.0</Version>
-    <Product>KAD Remote Agent</Product>
-    <Company>KADRemote</Company>
-    <Description>KAD Remote - Ultra-lightweight Headless Windows Server Agent</Description>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>1.4.0</Version>
+    <AssemblyVersion>1.4.0.0</AssemblyVersion>
+    <FileVersion>1.4.0.0</FileVersion>
+    <Product>KAD Remote Server Management</Product>
+    <Company>KAD Systems</Company>
+    <Copyright>Copyright (c) 2026 KAD Systems. All rights reserved.</Copyright>
+    <Description>KAD Remote - Windows Server Management Agent</Description>
+    <NeutralLanguage>vi-VN</NeutralLanguage>
 
-    <!-- Single-file trimmed headless publish settings for minimal RAM & disk -->
+    <!-- Slim uncompressed single-file publish with SourceGen JSON for low size & maximum Windows Defender/SmartScreen compatibility -->
+    <EnableRequestDelegateGenerator>false</EnableRequestDelegateGenerator>
+    <NoWarn>$(NoWarn);IL2026</NoWarn>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
-    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
+    <PublishTrimmed>true</PublishTrimmed>
+    <TrimMode>full</TrimMode>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <EventSourceSupport>false</EventSourceSupport>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <MetricsSupport>false</MetricsSupport>
+    <HttpActivityPropagationSupport>false</HttpActivityPropagationSupport>
     <ServerGarbageCollection>false</ServerGarbageCollection>
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
-    <PublishTrimmed>true</PublishTrimmed>
-    <TrimMode>partial</TrimMode>
   </PropertyGroup>
 
   <ItemGroup>
@@ -33,6 +46,10 @@
 
   <ItemGroup>
     <PackageReference Include="System.Drawing.Common" Version="9.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\ConfigSlot.txt" LogicalName="KADRemote.ConfigSlot.txt" />
   </ItemGroup>
 
 </Project>

@@ -169,7 +169,7 @@ public sealed class FileService
                 psi = new ProcessStartInfo
                 {
                     FileName = "powershell.exe",
-                    Arguments = $"-NoProfile -ExecutionPolicy Bypass -File \"{req.Path}\" {req.Args}".Trim(),
+                    Arguments = $"-NoLogo -NoProfile -File \"{req.Path}\" {req.Args}".Trim(),
                     WorkingDirectory = Path.GetDirectoryName(req.Path) ?? "",
                     UseShellExecute = !req.WaitForExit,
                     RedirectStandardOutput = req.WaitForExit,

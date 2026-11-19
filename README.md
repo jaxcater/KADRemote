@@ -23,6 +23,11 @@
    - **Xuất cấu hình (`Kad.exe` Headless)**: Tạo file `Kad.exe` cấu hình sẵn ngay trên iPhone để cài lên hàng chục Windows 10/11 nội bộ — chạy ẩn hoàn toàn (không hiện Tray/Taskbar), siêu nhẹ RAM (~9 MB private RAM), tự chạy lại khi khởi động máy, tự mở **Cloudflare Tunnel** (`https://*.trycloudflare.com` hoặc Named Tunnel) và tự động chuyển sang Tunnel khi iPhone ra ngoài dùng 4G/mạng khác.
 6. **Chạy nền trên iOS (khi user cho phép)**
    - Bật **Chạy nền** trong app iOS để giữ Hub lắng nghe và duy trì kết nối tới các Windows Server ngay cả khi chuyển app / tắt màn hình.
+7. **Cảnh báo mất hoặc bị xóa file `Kad.exe` trên dàn Windows Server (Real-time Alert)**
+   - Tự động giám sát sự tồn tại của file `Kad.exe` trên từng máy trong dàn Server (qua `FileSystemWatcher`, Hub WebSocket, Peer Watchdog giữa các Server trong LAN, và CloudSync mã hóa E2E).
+   - Khi bất kỳ máy chủ nào bị mất file `Kad.exe` hoặc bị xóa/dừng tiến trình trong khi Windows vẫn đang chạy, ứng dụng iOS lập tức hiển thị **Thông báo đẩy (Push/Local Notification)**, hộp thoại cảnh báo khẩn cấp, và gắn nhãn **`MẤT KAD.EXE`** màu đỏ kèm nút xuất lại `Kad.exe`.
+8. **Tương thích chuẩn Windows 10/11 & Windows Server (Clean PE & Manifest)**
+   - Tích hợp `app.manifest` chuẩn Windows 10/11/Server (`asInvoker`, `PerMonitorV2` DPI, `supportedOS` GUID), đóng gói Single-File không nén entropy cao (`EnableCompressionInSingleFile=false`), giữ nguyên metadata chuẩn .NET, nhúng cấu hình trực tiếp vào vùng nhớ `KADCFG_SLOT_V2` cố định (không nối thêm EOF overlay làm sai lệch kích thước PE) và thực thi lệnh qua Standard Input chuẩn.
 
 ---
 

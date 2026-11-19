@@ -17,6 +17,7 @@ public sealed class EmbeddedAgentConfig
     public string? CloudflareTunnelUrl { get; set; }
     public string? ExportedBy { get; set; }
     public string? ExportedAt { get; set; }
+    public string? WatchedExePath { get; set; }
 }
 
 public sealed record DiskInfoDto(
@@ -38,7 +39,10 @@ public sealed record SystemInfoDto(
     List<DiskInfoDto> Disks,
     List<string> LocalUrls,
     string? TunnelUrl,
-    string? MachineId = null
+    string? MachineId = null,
+    bool ExeMissing = false,
+    string? ExeStatusMessage = null,
+    string? ExePath = null
 );
 
 public sealed record ProcessInfoDto(
@@ -125,8 +129,23 @@ public sealed record ScreenInputMessage(
     double? Scale = null
 );
 
-public sealed record HealthResponse(string App, string Version, string Status, string Mode);
-public sealed record PingResponse(bool Ok, string DeviceName, DateTimeOffset Timestamp);
+public sealed record HealthResponse(
+    string App,
+    string Version,
+    string Status,
+    string Mode,
+    bool ExeMissing = false,
+    string? ExeStatusMessage = null
+);
+
+public sealed record PingResponse(
+    bool Ok,
+    string DeviceName,
+    DateTimeOffset Timestamp,
+    bool ExeMissing = false,
+    string? ExeStatusMessage = null
+);
+
 public sealed record ErrorResponse(string Error);
 public sealed record OkResponse(bool Ok, string? Message = null, string? Path = null);
 public sealed record UploadResponse(bool Ok, List<string> SavedPaths);
@@ -141,7 +160,9 @@ public sealed record PeerInfoDto(
     long TotalMemoryBytes,
     long UsedMemoryBytes,
     long UptimeSeconds,
-    DateTimeOffset LastSeenUtc
+    DateTimeOffset LastSeenUtc,
+    bool ExeMissing = false,
+    string? ExeStatusMessage = null
 );
 
 public sealed record UdpPeerBeaconPacket(
@@ -155,7 +176,9 @@ public sealed record UdpPeerBeaconPacket(
     double CpuUsagePercent,
     long TotalMemoryBytes,
     long UsedMemoryBytes,
-    long UptimeSeconds
+    long UptimeSeconds,
+    bool ExeMissing = false,
+    string? ExeStatusMessage = null
 );
 
 // Reverse Hub <-> Agent protocol messages
@@ -182,7 +205,9 @@ public sealed record CloudAnnouncementDto(
     long TotalMemoryBytes,
     long UsedMemoryBytes,
     long UptimeSeconds,
-    DateTimeOffset TimestampUtc
+    DateTimeOffset TimestampUtc,
+    bool ExeMissing = false,
+    string? ExeStatusMessage = null
 );
 
 public sealed record AgentRegisterMessage(
@@ -197,7 +222,9 @@ public sealed record AgentRegisterMessage(
     double CpuUsagePercent,
     long TotalMemoryBytes,
     long UsedMemoryBytes,
-    long UptimeSeconds
+    long UptimeSeconds,
+    bool ExeMissing = false,
+    string? ExeStatusMessage = null
 );
 
 public sealed record AgentHeartbeatMessage(
@@ -208,7 +235,20 @@ public sealed record AgentHeartbeatMessage(
     double CpuUsagePercent,
     long TotalMemoryBytes,
     long UsedMemoryBytes,
-    long UptimeSeconds
+    long UptimeSeconds,
+    bool ExeMissing = false,
+    string? ExeStatusMessage = null
+);
+
+public sealed record AgentAlertMessage(
+    string Type,
+    string AlertType,
+    string MachineId,
+    string DeviceName,
+    bool ExeMissing,
+    string Message,
+    string? ExePath,
+    DateTimeOffset TimestampUtc
 );
 
 public sealed record RelayHttpResponse(
@@ -257,6 +297,7 @@ public sealed record RelayWsEvent(
 [JsonSerializable(typeof(CloudAnnouncementDto))]
 [JsonSerializable(typeof(AgentRegisterMessage))]
 [JsonSerializable(typeof(AgentHeartbeatMessage))]
+[JsonSerializable(typeof(AgentAlertMessage))]
 [JsonSerializable(typeof(RelayHttpResponse))]
 [JsonSerializable(typeof(RelayWsEvent))]
 public partial class AgentJsonContext : JsonSerializerContext

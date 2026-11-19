@@ -15,6 +15,37 @@ struct DashboardView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
+                    if !store.exeMissingAlerts.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.red)
+                                Text("Cảnh báo mất file Kad.exe (\(store.exeMissingAlerts.count) Server)")
+                                    .font(.subheadline.bold())
+                                    .foregroundColor(.red)
+                                Spacer()
+                                Button("Ẩn") {
+                                    store.clearAllExeAlerts()
+                                }
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            }
+                            ForEach(Array(store.exeMissingAlerts.values)) { alert in
+                                Text("• \(alert.serverName): \(alert.message)")
+                                    .font(.caption)
+                                    .foregroundColor(.red)
+                            }
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.red.opacity(0.15))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(Color.red.opacity(0.6), lineWidth: 1)
+                        )
+                        .cornerRadius(10)
+                    }
+
                     if let banner = statusBanner {
                         Text(banner)
                             .font(.subheadline)

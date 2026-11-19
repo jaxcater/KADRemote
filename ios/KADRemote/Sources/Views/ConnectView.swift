@@ -97,6 +97,68 @@ struct ConnectView: View {
                         .cornerRadius(14)
                     }
 
+                    // Critical Alert Card when any Server in the fleet loses Kad.exe
+                    if !store.exeMissingAlerts.isEmpty {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.red)
+                                    .font(.title3)
+                                Text("Cảnh báo mất file Kad.exe (\(store.exeMissingAlerts.count) Server)")
+                                    .font(.headline)
+                                    .foregroundColor(.red)
+                                Spacer()
+                                Button("Xóa tất cả") {
+                                    store.clearAllExeAlerts()
+                                }
+                                .font(.caption.bold())
+                                .foregroundColor(.secondary)
+                            }
+
+                            ForEach(Array(store.exeMissingAlerts.values).sorted(by: { $0.detectedAt > $1.detectedAt })) { alert in
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack {
+                                        Text(alert.serverName)
+                                            .font(.subheadline.bold())
+                                            .foregroundColor(.primary)
+                                        Spacer()
+                                        Button {
+                                            store.dismissExeAlert(for: alert.id)
+                                        } label: {
+                                            Image(systemName: "xmark.circle.fill")
+                                                .foregroundColor(.secondary)
+                                        }
+                                    }
+                                    Text(alert.message)
+                                        .font(.caption)
+                                        .foregroundColor(.red)
+                                }
+                                .padding(10)
+                                .background(Color.red.opacity(0.12))
+                                .cornerRadius(10)
+                            }
+
+                            Button {
+                                showExportConfig = true
+                            } label: {
+                                Label("Xuất lại file Kad.exe để cài lại lên Server", systemImage: "arrow.down.doc.fill")
+                                    .font(.caption.bold())
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                                    .background(Color.red.opacity(0.22))
+                                    .foregroundColor(.red)
+                                    .cornerRadius(8)
+                            }
+                        }
+                        .padding()
+                        .background(Color(.secondarySystemBackground))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14)
+                                .stroke(Color.red.opacity(0.75), lineWidth: 1.5)
+                        )
+                        .cornerRadius(14)
+                    }
+
                     // Background Mode & Hub Listener Card
                     VStack(alignment: .leading, spacing: 10) {
                         Toggle(isOn: Binding(
@@ -196,6 +258,8 @@ struct ConnectView: View {
                                 let live = store.liveStatus(for: pc)
                                 let isOnline = store.isAgentOnline(pc)
                                 let viaTunnel = store.isUsingTunnel(pc)
+                                let exeAlert = store.exeMissingAlerts[pc.id]
+                                let isExeMissing = (pc.exeMissing == true) || (exeAlert != nil) || (live?.exeMissing == true)
 
                                 HStack {
                                     Button {
@@ -203,11 +267,11 @@ struct ConnectView: View {
                                     } label: {
                                         HStack(spacing: 12) {
                                             ZStack(alignment: .bottomTrailing) {
-                                                Image(systemName: pc.isAutoDiscovered == true ? "server.rack" : "desktopcomputer")
+                                                Image(systemName: isExeMissing ? "exclamationmark.triangle.fill" : (pc.isAutoDiscovered == true ? "server.rack" : "desktopcomputer"))
                                                     .font(.title2)
-                                                    .foregroundColor(isOnline ? (viaTunnel ? .cyan : .green) : .cyan)
+                                                    .foregroundColor(isExeMissing ? .red : (isOnline ? (viaTunnel ? .cyan : .green) : .cyan))
                                                 Circle()
-                                                    .fill(isOnline ? (viaTunnel ? Color.cyan : Color.green) : Color.gray)
+                                                    .fill(isExeMissing ? Color.red : (isOnline ? (viaTunnel ? Color.cyan : Color.green) : Color.gray))
                                                     .frame(width: 9, height: 9)
                                                     .offset(x: 2, y: 2)
                                             }
@@ -216,7 +280,15 @@ struct ConnectView: View {
                                                     Text(pc.name)
                                                         .font(.headline)
                                                         .foregroundColor(.primary)
-                                                    if isOnline {
+                                                    if isExeMissing {
+                                                        Text("MẤT KAD.EXE")
+                                                            .font(.system(size: 9, weight: .bold))
+                                                            .padding(.horizontal, 5)
+                                                            .padding(.vertical, 2)
+                                                            .background(Color.red.opacity(0.22))
+                                                            .foregroundColor(.red)
+                                                            .cornerRadius(4)
+                                                    } else if isOnline {
                                                         Text(viaTunnel ? "TUNNEL 4G" : "LAN")
                                                             .font(.system(size: 9, weight: .bold))
                                                             .padding(.horizontal, 5)
@@ -234,7 +306,12 @@ struct ConnectView: View {
                                                             .cornerRadius(4)
                                                     }
                                                 }
-                                                if let live {
+                                                if isExeMissing {
+                                                    Text(exeAlert?.message ?? pc.exeStatusMessage ?? live?.exeStatusMessage ?? "File Kad.exe trên máy chủ đã bị mất hoặc bị Windows xóa!")
+                                                        .font(.caption)
+                                                        .foregroundColor(.red)
+                                                        .lineLimit(2)
+                                                } else if let live {
                                                     Text("CPU \(String(format: "%.0f", live.cpuUsagePercent))% • RAM \(ByteFormatter.format(live.usedMemoryBytes))/\(ByteFormatter.format(live.totalMemoryBytes))")
                                                         .font(.caption)
                                                         .foregroundColor(.secondary)
@@ -272,6 +349,10 @@ struct ConnectView: View {
                                 }
                                 .padding()
                                 .background(Color(.secondarySystemBackground))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12)
+                                        .stroke(isExeMissing ? Color.red.opacity(0.75) : Color.clear, lineWidth: 1.5)
+                                )
                                 .cornerRadius(12)
                             }
                         }

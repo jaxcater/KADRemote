@@ -13,6 +13,8 @@ struct SavedPC: Codable, Identifiable, Equatable {
     var lastSeenTotalRam: Int64?
     var tunnelUrl: String?
     var localUrls: [String]?
+    var exeMissing: Bool?
+    var exeStatusMessage: String?
 
     var normalizedUrl: String {
         Self.normalizeUrl(url)
@@ -35,6 +37,14 @@ struct SavedPC: Codable, Identifiable, Equatable {
         }
         return trimmed
     }
+}
+
+struct ExeMissingAlert: Codable, Identifiable, Equatable {
+    var id: UUID
+    var machineId: String?
+    var serverName: String
+    var message: String
+    var detectedAt: Date
 }
 
 struct AgentExportConfig: Codable {
@@ -65,6 +75,8 @@ struct AgentLiveStatus: Equatable {
     let usedMemoryBytes: Int64
     let uptimeSeconds: Int64
     let lastHeartbeat: Date
+    let exeMissing: Bool
+    let exeStatusMessage: String?
 }
 
 struct PeerInfo: Codable, Identifiable {
@@ -78,6 +90,8 @@ struct PeerInfo: Codable, Identifiable {
     let usedMemoryBytes: Int64
     let uptimeSeconds: Int64
     let lastSeenUtc: String
+    let exeMissing: Bool?
+    let exeStatusMessage: String?
 
     var id: String { machineId }
 }
@@ -85,6 +99,8 @@ struct PeerInfo: Codable, Identifiable {
 struct PingResponse: Codable {
     let ok: Bool
     let deviceName: String
+    let exeMissing: Bool?
+    let exeStatusMessage: String?
 }
 
 struct DiskInfo: Codable, Identifiable {
@@ -114,6 +130,9 @@ struct SystemInfo: Codable {
     let localUrls: [String]
     let tunnelUrl: String?
     let machineId: String?
+    let exeMissing: Bool?
+    let exeStatusMessage: String?
+    let exePath: String?
 
     var memoryRatio: Double {
         guard totalMemoryBytes > 0 else { return 0 }

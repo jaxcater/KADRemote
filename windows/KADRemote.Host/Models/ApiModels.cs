@@ -18,7 +18,10 @@ public sealed record SystemInfoDto(
     int MonitorCount,
     List<DiskInfoDto> Disks,
     List<string> LocalUrls,
-    string? TunnelUrl
+    string? TunnelUrl,
+    bool ExeMissing = false,
+    string? ExeStatusMessage = null,
+    string? ExePath = null
 );
 
 public sealed record ProcessInfoDto(

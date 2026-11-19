@@ -16,9 +16,13 @@ final class ConnectionStore: ObservableObject {
     @Published var isRefreshingStatuses: Bool = false
     @Published var isDiscovering: Bool = false
     @Published var discoveryStatus: String?
+    @Published var exeMissingAlerts: [UUID: ExeMissingAlert] = [:]
+    @Published var latestExePopupAlert: ExeMissingAlert?
 
     private let pcsKey = "kad_saved_pcs_v1"
     private let activeIdKey = "kad_active_pc_id_v1"
+    private let alertsKey = "kad_exe_missing_alerts_v1"
+    private var consecutiveAliveWithoutKad: [UUID: Int] = [:]
 
     weak var hub: AgentHubServer?
     weak var backgroundManager: BackgroundManager?
@@ -52,11 +56,18 @@ final class ConnectionStore: ObservableObject {
 
         hub.onAgentDisconnected = { [weak self] machineId, name in
             Task { @MainActor [weak self] in
-                self?.backgroundManager?.notifyIfInBackground(
+                guard let self else { return }
+                self.backgroundManager?.notifyIfInBackground(
                     title: "KAD Remote",
                     body: "\(name) đã ngắt kết nối khỏi Hub LAN."
                 )
-                let _ = machineId
+                await self.verifyDisconnectedAgentExeHealth(machineId: machineId, deviceName: name)
+            }
+        }
+
+        hub.onAgentExeAlert = { [weak self] machineId, deviceName, exeMissing, message in
+            Task { @MainActor [weak self] in
+                self?.handleAgentExeAlert(machineId: machineId, deviceName: deviceName, exeMissing: exeMissing, message: message)
             }
         }
 
@@ -72,6 +83,10 @@ final class ConnectionStore: ObservableObject {
            let decoded = try? JSONDecoder().decode([SavedPC].self, from: data) {
             savedPCs = decoded
         }
+        if let alertData = UserDefaults.standard.data(forKey: alertsKey),
+           let decodedAlerts = try? JSONDecoder().decode([UUID: ExeMissingAlert].self, from: alertData) {
+            exeMissingAlerts = decodedAlerts
+        }
         if let idStr = UserDefaults.standard.string(forKey: activeIdKey),
            let uuid = UUID(uuidString: idStr),
            let found = savedPCs.first(where: { $0.id == uuid }) {
@@ -83,10 +98,156 @@ final class ConnectionStore: ObservableObject {
         if let encoded = try? JSONEncoder().encode(savedPCs) {
             UserDefaults.standard.set(encoded, forKey: pcsKey)
         }
+        if let encodedAlerts = try? JSONEncoder().encode(exeMissingAlerts) {
+            UserDefaults.standard.set(encodedAlerts, forKey: alertsKey)
+        }
         if let activeId = activePC?.id.uuidString {
             UserDefaults.standard.set(activeId, forKey: activeIdKey)
         } else {
             UserDefaults.standard.removeObject(forKey: activeIdKey)
+        }
+    }
+
+    func dismissExeAlert(for pcId: UUID) {
+        exeMissingAlerts.removeValue(forKey: pcId)
+        if latestExePopupAlert?.id == pcId {
+            latestExePopupAlert = nil
+        }
+        save()
+    }
+
+    func clearAllExeAlerts() {
+        exeMissingAlerts.removeAll()
+        latestExePopupAlert = nil
+        save()
+    }
+
+    func handleAgentExeAlert(machineId: String, deviceName: String, exeMissing: Bool, message: String?) {
+        if let pc = savedPCs.first(where: { $0.machineId == machineId || $0.name.caseInsensitiveCompare(deviceName) == .orderedSame }) {
+            recordExeStatus(
+                for: pc.id,
+                machineId: machineId,
+                serverName: pc.name,
+                exeMissing: exeMissing,
+                message: message
+            )
+        } else if exeMissing {
+            let fallbackId = UUID()
+            let msg = message ?? "CẢNH BÁO: File Kad.exe trên máy \(deviceName) đã bị mất hoặc bị Windows xóa!"
+            let alert = ExeMissingAlert(
+                id: fallbackId,
+                machineId: machineId,
+                serverName: deviceName,
+                message: msg,
+                detectedAt: Date()
+            )
+            exeMissingAlerts[fallbackId] = alert
+            latestExePopupAlert = alert
+            backgroundManager?.notifyExeMissingAlert(serverKey: machineId, serverName: deviceName, message: msg)
+            save()
+        }
+    }
+
+    func recordExeStatus(
+        for pcId: UUID,
+        machineId: String?,
+        serverName: String,
+        exeMissing: Bool,
+        message: String?
+    ) {
+        let serverKey = (machineId?.isEmpty == false) ? machineId! : pcId.uuidString
+        if exeMissing {
+            let msg = (message?.isEmpty == false)
+                ? message!
+                : "CẢNH BÁO: File Kad.exe trên máy \(serverName) đã bị mất hoặc bị Windows xóa!"
+            let wasAlreadyAlerted = exeMissingAlerts[pcId] != nil
+
+            if let idx = savedPCs.firstIndex(where: { $0.id == pcId }) {
+                savedPCs[idx].exeMissing = true
+                savedPCs[idx].exeStatusMessage = msg
+                if activePC?.id == pcId {
+                    activePC = savedPCs[idx]
+                }
+            }
+
+            let alert = ExeMissingAlert(
+                id: pcId,
+                machineId: machineId,
+                serverName: serverName,
+                message: msg,
+                detectedAt: exeMissingAlerts[pcId]?.detectedAt ?? Date()
+            )
+            exeMissingAlerts[pcId] = alert
+            if !wasAlreadyAlerted {
+                latestExePopupAlert = alert
+            }
+            backgroundManager?.notifyExeMissingAlert(serverKey: serverKey, serverName: serverName, message: msg)
+            save()
+        } else {
+            consecutiveAliveWithoutKad[pcId] = 0
+            var changed = false
+            if let idx = savedPCs.firstIndex(where: { $0.id == pcId }) {
+                if savedPCs[idx].exeMissing == true || savedPCs[idx].exeStatusMessage != nil {
+                    savedPCs[idx].exeMissing = false
+                    savedPCs[idx].exeStatusMessage = nil
+                    if activePC?.id == pcId {
+                        activePC = savedPCs[idx]
+                    }
+                    changed = true
+                }
+            }
+            if exeMissingAlerts.removeValue(forKey: pcId) != nil {
+                changed = true
+            }
+            if latestExePopupAlert?.id == pcId {
+                latestExePopupAlert = nil
+            }
+            backgroundManager?.clearExeAlertCooldown(serverKey: serverKey)
+            if changed {
+                save()
+            }
+        }
+    }
+
+    private func verifyDisconnectedAgentExeHealth(machineId: String, deviceName: String) async {
+        try? await Task.sleep(nanoseconds: 2_200_000_000)
+        if hub?.onlineAgents[machineId] != nil {
+            return
+        }
+        guard let pc = savedPCs.first(where: { $0.machineId == machineId }) else { return }
+        let client = APIClient(pc: pc)
+        var lanCandidates = [pc.normalizedUrl]
+        for extra in (pc.localUrls ?? []) {
+            let norm = SavedPC.normalizeUrl(extra)
+            if !lanCandidates.contains(norm) { lanCandidates.append(norm) }
+        }
+        for lan in lanCandidates {
+            if let resp = try? await client.pingSpecificBase(lan, timeout: 1.2) {
+                recordExeStatus(
+                    for: pc.id,
+                    machineId: pc.machineId,
+                    serverName: pc.name,
+                    exeMissing: resp.exeMissing ?? false,
+                    message: resp.exeStatusMessage
+                )
+                return
+            }
+        }
+        if await Self.isWindowsHostAliveWithoutKad(lanUrls: lanCandidates) {
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            if hub?.onlineAgents[machineId] != nil { return }
+            for lan in lanCandidates {
+                if (try? await client.pingSpecificBase(lan, timeout: 1.2)) != nil {
+                    return
+                }
+            }
+            recordExeStatus(
+                for: pc.id,
+                machineId: pc.machineId,
+                serverName: pc.name,
+                exeMissing: true,
+                message: "CẢNH BÁO: Máy chủ \(deviceName) vẫn đang bật trên mạng nhưng tiến trình Kad.exe đã biến mất (file Kad.exe có thể đã bị mất hoặc bị Windows xóa)!"
+            )
         }
     }
 
@@ -111,6 +272,15 @@ final class ConnectionStore: ObservableObject {
             backgroundManager?.notifyIfInBackground(
                 title: "Server mới đã kết nối",
                 body: "\(status.deviceName) (\(bestUrl)) đã tự động ghép nối."
+            )
+        }
+        if let pc = savedPCs.first(where: { $0.machineId == status.machineId }) {
+            recordExeStatus(
+                for: pc.id,
+                machineId: status.machineId,
+                serverName: status.deviceName,
+                exeMissing: status.exeMissing,
+                message: status.exeStatusMessage
             )
         }
     }
@@ -139,6 +309,13 @@ final class ConnectionStore: ObservableObject {
         if changed {
             save()
         }
+        recordExeStatus(
+            for: existing.id,
+            machineId: status.machineId,
+            serverName: existing.name,
+            exeMissing: status.exeMissing,
+            message: status.exeStatusMessage
+        )
     }
 
     func updatePCMetadata(from info: SystemInfo, for pcId: UUID) {
@@ -164,6 +341,13 @@ final class ConnectionStore: ObservableObject {
             }
             save()
         }
+        recordExeStatus(
+            for: pcId,
+            machineId: info.machineId ?? pc.machineId,
+            serverName: pc.name,
+            exeMissing: info.exeMissing ?? false,
+            message: info.exeStatusMessage
+        )
     }
 
     func isAgentOnline(_ pc: SavedPC) -> Bool {
@@ -220,6 +404,15 @@ final class ConnectionStore: ObservableObject {
                 totalRam: peer.totalMemoryBytes
             )
             if isNew { discoveredCount += 1 }
+            if let pc = savedPCs.first(where: { $0.machineId == peer.machineId }) {
+                recordExeStatus(
+                    for: pc.id,
+                    machineId: peer.machineId,
+                    serverName: peer.deviceName,
+                    exeMissing: peer.exeMissing,
+                    message: peer.exeStatusMessage
+                )
+            }
         }
 
         for ann in cloudPeers {
@@ -237,10 +430,18 @@ final class ConnectionStore: ObservableObject {
                 totalRam: ann.totalMemoryBytes
             )
             if isNew { discoveredCount += 1 }
-            if let t = ann.tunnelUrl, !t.isEmpty,
-               let pc = savedPCs.first(where: { $0.machineId == ann.machineId }) {
-                remoteOnlineIds.insert(pc.id)
-                tunnelActiveIds.insert(pc.id)
+            if let pc = savedPCs.first(where: { $0.machineId == ann.machineId }) {
+                if let t = ann.tunnelUrl, !t.isEmpty, ann.exeMissing != true {
+                    remoteOnlineIds.insert(pc.id)
+                    tunnelActiveIds.insert(pc.id)
+                }
+                recordExeStatus(
+                    for: pc.id,
+                    machineId: ann.machineId,
+                    serverName: ann.deviceName,
+                    exeMissing: ann.exeMissing ?? false,
+                    message: ann.exeStatusMessage
+                )
             }
         }
 
@@ -248,8 +449,9 @@ final class ConnectionStore: ObservableObject {
             let lanFound = await scanLocalSubnet(token: token, agentPort: agentPort)
             for item in lanFound {
                 let best = Self.selectBestLocalUrl(from: item.info.localUrls, remoteIP: item.ip, agentPort: agentPort)
+                let mid = item.info.machineId ?? item.ip
                 let isNew = upsertDiscoveredServer(
-                    machineId: item.info.machineId ?? item.ip,
+                    machineId: mid,
                     deviceName: item.info.deviceName,
                     bestUrl: best,
                     localUrls: item.info.localUrls,
@@ -260,6 +462,15 @@ final class ConnectionStore: ObservableObject {
                     totalRam: item.info.totalMemoryBytes
                 )
                 if isNew { discoveredCount += 1 }
+                if let pc = savedPCs.first(where: { $0.machineId == mid }) {
+                    recordExeStatus(
+                        for: pc.id,
+                        machineId: mid,
+                        serverName: item.info.deviceName,
+                        exeMissing: item.info.exeMissing ?? false,
+                        message: item.info.exeStatusMessage
+                    )
+                }
             }
         }
 
@@ -299,6 +510,13 @@ final class ConnectionStore: ObservableObject {
             )
             if let pc = savedPCs.first(where: { $0.machineId == peer.machineId }) {
                 remoteOnlineIds.insert(pc.id)
+                recordExeStatus(
+                    for: pc.id,
+                    machineId: peer.machineId,
+                    serverName: peer.deviceName,
+                    exeMissing: peer.exeMissing,
+                    message: peer.exeStatusMessage
+                )
             }
         }
 
@@ -316,12 +534,20 @@ final class ConnectionStore: ObservableObject {
                 usedRam: ann.usedMemoryBytes,
                 totalRam: ann.totalMemoryBytes
             )
-            if let t = ann.tunnelUrl, !t.isEmpty,
-               let pc = savedPCs.first(where: { $0.machineId == ann.machineId }) {
-                remoteOnlineIds.insert(pc.id)
-                if hub.onlineAgents[ann.machineId] == nil {
-                    tunnelActiveIds.insert(pc.id)
+            if let pc = savedPCs.first(where: { $0.machineId == ann.machineId }) {
+                if let t = ann.tunnelUrl, !t.isEmpty, ann.exeMissing != true {
+                    remoteOnlineIds.insert(pc.id)
+                    if hub.onlineAgents[ann.machineId] == nil {
+                        tunnelActiveIds.insert(pc.id)
+                    }
                 }
+                recordExeStatus(
+                    for: pc.id,
+                    machineId: ann.machineId,
+                    serverName: ann.deviceName,
+                    exeMissing: ann.exeMissing ?? false,
+                    message: ann.exeStatusMessage
+                )
             }
         }
     }
@@ -335,7 +561,7 @@ final class ConnectionStore: ObservableObject {
         var reachableGateways: [(SavedPC, Bool)] = []
         var bestWorkingUrls: [UUID: String] = [:]
 
-        await withTaskGroup(of: (UUID, Bool, Bool, String?).self) { group in
+        await withTaskGroup(of: (UUID, Bool, Bool, String?, PingResponse?, Bool).self) { group in
             for pc in savedPCs {
                 group.addTask {
                     let client = APIClient(pc: pc)
@@ -348,20 +574,22 @@ final class ConnectionStore: ObservableObject {
                     }
 
                     for lan in lanCandidates {
-                        if (try? await client.pingSpecificBase(lan, timeout: 1.1)) != nil {
-                            return (pc.id, true, false, lan)
+                        if let resp = try? await client.pingSpecificBase(lan, timeout: 1.1) {
+                            return (pc.id, true, false, lan, resp, false)
                         }
                     }
 
                     if let tunnel = pc.normalizedTunnelUrl,
-                       (try? await client.pingSpecificBase(tunnel, timeout: 3.0)) != nil {
-                        return (pc.id, true, true, nil)
+                       let resp = try? await client.pingSpecificBase(tunnel, timeout: 3.0) {
+                        return (pc.id, true, true, nil, resp, false)
                     }
-                    return (pc.id, false, false, nil)
+
+                    let hostAliveNoKad = await Self.isWindowsHostAliveWithoutKad(lanUrls: lanCandidates)
+                    return (pc.id, false, false, nil, nil, hostAliveNoKad)
                 }
             }
 
-                    for await (id, ok, viaTunnel, workingLan) in group {
+            for await (id, ok, viaTunnel, workingLan, pingResp, hostAliveNoKad) in group {
                 if ok {
                     onlineRemote.insert(id)
                     if viaTunnel {
@@ -374,9 +602,29 @@ final class ConnectionStore: ObservableObject {
                     }
                     if let pc = savedPCs.first(where: { $0.id == id }) {
                         reachableGateways.append((pc, viaTunnel))
+                        recordExeStatus(
+                            for: pc.id,
+                            machineId: pc.machineId,
+                            serverName: pc.name,
+                            exeMissing: pingResp?.exeMissing ?? false,
+                            message: pingResp?.exeStatusMessage
+                        )
+                    }
+                } else if hostAliveNoKad, let pc = savedPCs.first(where: { $0.id == id }) {
+                    let count = (consecutiveAliveWithoutKad[id] ?? 0) + 1
+                    consecutiveAliveWithoutKad[id] = count
+                    if count >= 2 {
+                        recordExeStatus(
+                            for: pc.id,
+                            machineId: pc.machineId,
+                            serverName: pc.name,
+                            exeMissing: true,
+                            message: "CẢNH BÁO: Máy chủ \(pc.name) vẫn đang bật trên mạng nhưng không tìm thấy Kad.exe (file Kad.exe có thể đã bị mất hoặc bị Windows xóa)!"
+                        )
                     }
                 } else if let pc = savedPCs.first(where: { $0.id == id }),
                           pc.normalizedTunnelUrl != nil,
+                          pc.exeMissing != true,
                           let lastConn = pc.lastConnected,
                           Date().timeIntervalSince(lastConn) < 90 {
                     // Keep freshly announced Cloud Tunnel PC marked ready while Cloudflare edge DNS warms up
@@ -425,12 +673,19 @@ final class ConnectionStore: ObservableObject {
                 pc.lastSeenUsedRam = peer.usedMemoryBytes
                 pc.lastSeenTotalRam = peer.totalMemoryBytes
                 savedPCs[idx] = pc
-                if pc.normalizedTunnelUrl != nil {
+                if pc.normalizedTunnelUrl != nil && peer.exeMissing != true {
                     remoteOnlineIds.insert(pc.id)
                     if preferTunnel {
                         tunnelActiveIds.insert(pc.id)
                     }
                 }
+                recordExeStatus(
+                    for: pc.id,
+                    machineId: peer.machineId,
+                    serverName: pc.name,
+                    exeMissing: peer.exeMissing ?? false,
+                    message: peer.exeStatusMessage
+                )
             } else if let t = peer.tunnelUrl, !t.isEmpty {
                 let best = Self.selectBestLocalUrl(from: peer.localUrls, remoteIP: nil, agentPort: peer.agentPort)
                 let newPC = SavedPC(
@@ -444,13 +699,24 @@ final class ConnectionStore: ObservableObject {
                     lastSeenUsedRam: peer.usedMemoryBytes,
                     lastSeenTotalRam: peer.totalMemoryBytes,
                     tunnelUrl: t,
-                    localUrls: peer.localUrls
+                    localUrls: peer.localUrls,
+                    exeMissing: peer.exeMissing,
+                    exeStatusMessage: peer.exeStatusMessage
                 )
                 savedPCs.append(newPC)
-                remoteOnlineIds.insert(newPC.id)
-                if preferTunnel {
-                    tunnelActiveIds.insert(newPC.id)
+                if peer.exeMissing != true {
+                    remoteOnlineIds.insert(newPC.id)
+                    if preferTunnel {
+                        tunnelActiveIds.insert(newPC.id)
+                    }
                 }
+                recordExeStatus(
+                    for: newPC.id,
+                    machineId: peer.machineId,
+                    serverName: peer.deviceName,
+                    exeMissing: peer.exeMissing ?? false,
+                    message: peer.exeStatusMessage
+                )
                 updatedAny = true
             }
         }
@@ -779,6 +1045,8 @@ final class ConnectionStore: ObservableObject {
         let totalMemoryBytes: Int64
         let usedMemoryBytes: Int64
         let remoteIP: String
+        let exeMissing: Bool
+        let exeStatusMessage: String?
     }
 
     private nonisolated static func probeUdpAgents(token: String, peerPort: Int) async -> [UdpPeerReply] {
@@ -853,7 +1121,9 @@ final class ConnectionStore: ObservableObject {
                     cpuUsagePercent: obj["cpuUsagePercent"] as? Double ?? 0,
                     totalMemoryBytes: (obj["totalMemoryBytes"] as? NSNumber)?.int64Value ?? 0,
                     usedMemoryBytes: (obj["usedMemoryBytes"] as? NSNumber)?.int64Value ?? 0,
-                    remoteIP: remoteIP
+                    remoteIP: remoteIP,
+                    exeMissing: obj["exeMissing"] as? Bool ?? false,
+                    exeStatusMessage: obj["exeStatusMessage"] as? String
                 ))
             }
 
@@ -872,6 +1142,101 @@ final class ConnectionStore: ObservableObject {
         let totalMemoryBytes: Int64
         let usedMemoryBytes: Int64
         let uptimeSeconds: Int64?
+        let exeMissing: Bool?
+        let exeStatusMessage: String?
+    }
+
+    /// Checks whether a Windows server at any of `lanUrls` is powered ON and responding on the LAN
+    /// (either via TCP ECONNREFUSED on agentPort or TCP response on standard Windows ports 135/445/3389)
+    /// while Kad.exe itself is no longer listening.
+    private nonisolated static func isWindowsHostAliveWithoutKad(lanUrls: [String]) async -> Bool {
+        await Task.detached(priority: .utility) {
+            for raw in lanUrls {
+                guard let url = URL(string: raw),
+                      let host = url.host,
+                      !host.isEmpty,
+                      host != "127.0.0.1",
+                      !host.lowercased().hasSuffix(".trycloudflare.com") else {
+                    continue
+                }
+                let agentPort = UInt16(url.port ?? 7788)
+
+                // 1. If TCP connect to agentPort actively returns ECONNREFUSED (RST), the Windows TCP stack is alive, but Kad.exe is not running!
+                let agentRes = probeTcpPort(ip: host, port: agentPort, timeoutMs: 650)
+                if agentRes == .refused {
+                    return true
+                }
+
+                // 2. If Windows Firewall silently drops packets on agentPort when Kad.exe is gone, probe Windows RPC (135) or SMB (445)
+                if agentRes == .timedOut {
+                    for winPort: UInt16 in [135, 445, 3389] {
+                        let winRes = probeTcpPort(ip: host, port: winPort, timeoutMs: 550)
+                        if winRes == .connected || winRes == .refused {
+                            return true
+                        }
+                    }
+                }
+            }
+            return false
+        }.value
+    }
+
+    private enum TcpProbeResult {
+        case connected
+        case refused
+        case timedOut
+        case unreachable
+    }
+
+    private nonisolated static func probeTcpPort(ip: String, port: UInt16, timeoutMs: Int32) -> TcpProbeResult {
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        guard inet_pton(AF_INET, ip, &addr.sin_addr) == 1 else {
+            return .unreachable
+        }
+
+        let fd = Darwin.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        guard fd >= 0 else { return .unreachable }
+        defer { Darwin.close(fd) }
+
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+
+        let rc = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+
+        if rc == 0 {
+            return .connected
+        }
+        if errno == ECONNREFUSED {
+            return .refused
+        }
+        if errno != EINPROGRESS {
+            return .unreachable
+        }
+
+        var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        let pr = Darwin.poll(&pfd, 1, timeoutMs)
+        if pr <= 0 {
+            return .timedOut
+        }
+
+        var soError: Int32 = 0
+        var len = socklen_t(MemoryLayout<Int32>.size)
+        if getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &len) == 0 {
+            if soError == 0 {
+                return .connected
+            }
+            if soError == ECONNREFUSED {
+                return .refused
+            }
+        }
+        return .unreachable
     }
 
     private nonisolated static func fetchCloudAnnouncements(token: String, requestLiveReply: Bool = false) async -> [CloudAnnouncementPayload] {

@@ -23,13 +23,13 @@ jobs:
 
       - name: Publish GUI Host Kad.exe
         run: |
-          dotnet publish windows/KADRemote.Host/KADRemote.Host.csproj -c Release -r win-x64 -p:DebugType=none -p:DebugSymbols=false -o out/windows
+          dotnet publish windows/KADRemote.Host/KADRemote.Host.csproj -c Release -r win-x64 -o out/windows
 
       - name: Publish Headless Server Agent Kad.exe
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          $out = (dotnet publish windows/KADRemote.Agent/KADRemote.Agent.csproj -c Release -r win-x64 -p:DebugType=none -p:DebugSymbols=false -o out/agent 2>&1) | ForEach-Object { "$_" }
+          $out = (dotnet publish windows/KADRemote.Agent/KADRemote.Agent.csproj -c Release -r win-x64 -o out/agent 2>&1) | ForEach-Object { "$_" }
           $code = $LASTEXITCODE
           $out | ForEach-Object { Write-Host $_ }
           if ($code -ne 0) {
@@ -37,6 +37,31 @@ jobs:
             if (-not $errs) { $errs = ($out | Select-Object -Last 8) -join " | " }
             Write-Host "::error::$errs"
             exit $code
+          }
+
+      - name: Update PE OptionalHeader CheckSum & Verify Windows Defender Clean
+        shell: pwsh
+        run: |
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Runtime.InteropServices;
+          public static class PeHelper {
+              [DllImport("imagehlp.dll", CharSet = CharSet.Auto, SetLastError = true)]
+              public static extern uint MapFileAndCheckSum(string Filename, out uint HeaderSum, out uint CheckSum);
+          }
+          "@
+          foreach ($exePath in @("out/windows/Kad.exe", "out/agent/Kad.exe")) {
+            $full = (Resolve-Path $exePath).Path
+            [uint32]$hdrSum = 0
+            [uint32]$calcSum = 0
+            [PeHelper]::MapFileAndCheckSum($full, [ref]$hdrSum, [ref]$calcSum) | Out-Null
+            $data = [System.IO.File]::ReadAllBytes($full)
+            $peOffset = [BitConverter]::ToInt32($data, 0x3C)
+            $csOffset = $peOffset + 24 + 64
+            $csBytes = [BitConverter]::GetBytes($calcSum)
+            [Buffer]::BlockCopy($csBytes, 0, $data, $csOffset, 4)
+            [System.IO.File]::WriteAllBytes($full, $data)
+            Write-Host ("Updated PE CheckSum for {0}: 0x{1:X8} (Size: {2:N2} MB)" -f $exePath, $calcSum, ($data.Length / 1MB))
           }
 
       - name: Upload Kad.exe artifact

@@ -27,6 +27,18 @@ struct KADRemoteApp: App {
             .environmentObject(hub)
             .environmentObject(backgroundManager)
             .preferredColorScheme(.dark)
+            .alert(item: $store.latestExePopupAlert) { alert in
+                Alert(
+                    title: Text("⚠️ Mất file Kad.exe — \(alert.serverName)"),
+                    message: Text(alert.message),
+                    primaryButton: .default(Text("Đã hiểu")) {
+                        store.latestExePopupAlert = nil
+                    },
+                    secondaryButton: .destructive(Text("Xóa cảnh báo")) {
+                        store.dismissExeAlert(for: alert.id)
+                    }
+                )
+            }
             .onAppear {
                 if !didBootstrap {
                     didBootstrap = true

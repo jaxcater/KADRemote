@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
-using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 
 namespace KADRemote.Agent.Services;
@@ -14,9 +13,6 @@ public sealed partial class CloudflareTunnelService : IDisposable
         "KADRemote",
         "cloudflared.exe"
     );
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool DeleteFileW(string lpFileName);
 
     [GeneratedRegex(@"https://[a-zA-Z0-9\-]+\.trycloudflare\.com", RegexOptions.Compiled)]
     private static partial Regex TunnelUrlRegex();
@@ -159,7 +155,6 @@ public sealed partial class CloudflareTunnelService : IDisposable
 
         if (File.Exists(LocalBinaryPath) && new FileInfo(LocalBinaryPath).Length > 1_000_000)
         {
-            StripZoneIdentifier(LocalBinaryPath);
             return LocalBinaryPath;
         }
 
@@ -179,14 +174,8 @@ public sealed partial class CloudflareTunnelService : IDisposable
         if (File.Exists(LocalBinaryPath))
             File.Delete(LocalBinaryPath);
         File.Move(tempPath, LocalBinaryPath);
-        StripZoneIdentifier(LocalBinaryPath);
 
         return LocalBinaryPath;
-    }
-
-    private static void StripZoneIdentifier(string path)
-    {
-        try { DeleteFileW(path + ":Zone.Identifier"); } catch { }
     }
 
     public void Dispose()

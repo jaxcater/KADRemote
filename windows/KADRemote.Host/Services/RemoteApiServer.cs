@@ -77,12 +77,22 @@ public sealed class RemoteApiServer : IAsyncDisposable
         });
 
         // Public health probe (no secrets)
-        app.MapGet("/api/health", () => Results.Ok(new
+        app.MapGet("/api/health", () =>
         {
-            app = "KADRemote",
-            version = "1.0.0",
-            status = "online"
-        }));
+            var exePath = Environment.ProcessPath;
+            bool exeMissing = !string.IsNullOrWhiteSpace(exePath) && !File.Exists(exePath);
+            string? exeMsg = exeMissing
+                ? $"CẢNH BÁO: File Kad.exe trên máy {_config.Current.DeviceName} đã bị mất hoặc bị Windows xóa tại: {exePath}"
+                : null;
+            return Results.Ok(new
+            {
+                app = "KADRemote",
+                version = "1.4.0",
+                status = "online",
+                exeMissing,
+                exeStatusMessage = exeMsg
+            });
+        });
 
         // Token authentication middleware for all other routes
         app.Use(async (ctx, next) =>
@@ -104,12 +114,22 @@ public sealed class RemoteApiServer : IAsyncDisposable
         });
 
         // Verify token + handshake
-        app.MapGet("/api/ping", () => Results.Ok(new
+        app.MapGet("/api/ping", () =>
         {
-            ok = true,
-            deviceName = _config.Current.DeviceName,
-            timestamp = DateTimeOffset.UtcNow
-        }));
+            var exePath = Environment.ProcessPath;
+            bool exeMissing = !string.IsNullOrWhiteSpace(exePath) && !File.Exists(exePath);
+            string? exeMsg = exeMissing
+                ? $"CẢNH BÁO: File Kad.exe trên máy {_config.Current.DeviceName} đã bị mất hoặc bị Windows xóa tại: {exePath}"
+                : null;
+            return Results.Ok(new
+            {
+                ok = true,
+                deviceName = _config.Current.DeviceName,
+                timestamp = DateTimeOffset.UtcNow,
+                exeMissing,
+                exeStatusMessage = exeMsg
+            });
+        });
 
         // System Info & Processes & Power
         app.MapGet("/api/system/info", () =>

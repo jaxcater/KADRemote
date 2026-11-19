@@ -172,6 +172,12 @@ public sealed class SystemService
             }
         }
 
+        var exePath = Environment.ProcessPath;
+        bool exeMissing = !string.IsNullOrWhiteSpace(exePath) && !File.Exists(exePath);
+        string? exeMsg = exeMissing
+            ? $"CẢNH BÁO: File Kad.exe trên máy {deviceName} đã bị mất hoặc bị Windows xóa tại: {exePath}"
+            : null;
+
         return new SystemInfoDto(
             DeviceName: deviceName,
             OsVersion: Environment.OSVersion.VersionString,
@@ -183,7 +189,10 @@ public sealed class SystemService
             MonitorCount: Screen.AllScreens.Length,
             Disks: disks,
             LocalUrls: GetLocalUrls(port),
-            TunnelUrl: tunnelUrl
+            TunnelUrl: tunnelUrl,
+            ExeMissing: exeMissing,
+            ExeStatusMessage: exeMsg,
+            ExePath: exePath
         );
     }
 

@@ -117,6 +117,7 @@ final class AgentHubServer: ObservableObject {
     var onAgentRegistered: ((AgentLiveStatus, String) -> Void)?
     var onAgentHeartbeat: ((AgentLiveStatus) -> Void)?
     var onAgentDisconnected: ((String, String) -> Void)?
+    var onAgentExeAlert: ((String, String, Bool, String?) -> Void)?
 
     private var wsListener: NWListener?
     private var isWsReady: Bool = false
@@ -461,6 +462,8 @@ final class AgentHubServer: ObservableObject {
             let totalMem = (obj["totalMemoryBytes"] as? NSNumber)?.int64Value ?? 0
             let usedMem = (obj["usedMemoryBytes"] as? NSNumber)?.int64Value ?? 0
             let uptime = (obj["uptimeSeconds"] as? NSNumber)?.int64Value ?? 0
+            let exeMissing = obj["exeMissing"] as? Bool ?? false
+            let exeMsg = obj["exeStatusMessage"] as? String
             let remoteIP = Self.extractRemoteIP(conn.endpoint)
 
             sessions[machineId]?.cancel()
@@ -477,10 +480,15 @@ final class AgentHubServer: ObservableObject {
                 totalMemoryBytes: totalMem,
                 usedMemoryBytes: usedMem,
                 uptimeSeconds: uptime,
-                lastHeartbeat: Date()
+                lastHeartbeat: Date(),
+                exeMissing: exeMissing,
+                exeStatusMessage: exeMsg
             )
             onlineAgents[machineId] = status
             onAgentRegistered?(status, token)
+            if exeMissing {
+                onAgentExeAlert?(machineId, deviceName, true, exeMsg)
+            }
 
         case "heartbeat":
             guard let machineId = obj["machineId"] as? String,
@@ -491,6 +499,8 @@ final class AgentHubServer: ObservableObject {
             let totalMem = (obj["totalMemoryBytes"] as? NSNumber)?.int64Value ?? existing.totalMemoryBytes
             let usedMem = (obj["usedMemoryBytes"] as? NSNumber)?.int64Value ?? existing.usedMemoryBytes
             let uptime = (obj["uptimeSeconds"] as? NSNumber)?.int64Value ?? existing.uptimeSeconds
+            let exeMissing = obj["exeMissing"] as? Bool ?? existing.exeMissing
+            let exeMsg = (obj["exeStatusMessage"] as? String) ?? (exeMissing ? existing.exeStatusMessage : nil)
 
             let updated = AgentLiveStatus(
                 machineId: machineId,
@@ -503,10 +513,22 @@ final class AgentHubServer: ObservableObject {
                 totalMemoryBytes: totalMem,
                 usedMemoryBytes: usedMem,
                 uptimeSeconds: uptime,
-                lastHeartbeat: Date()
+                lastHeartbeat: Date(),
+                exeMissing: exeMissing,
+                exeStatusMessage: exeMsg
             )
             onlineAgents[machineId] = updated
             onAgentHeartbeat?(updated)
+            if exeMissing != existing.exeMissing {
+                onAgentExeAlert?(machineId, existing.deviceName, exeMissing, exeMsg)
+            }
+
+        case "agent_alert":
+            let machineId = obj["machineId"] as? String ?? connId
+            let deviceName = obj["deviceName"] as? String ?? onlineAgents[machineId]?.deviceName ?? "Windows Server"
+            let exeMissing = obj["exeMissing"] as? Bool ?? true
+            let msg = obj["message"] as? String
+            onAgentExeAlert?(machineId, deviceName, exeMissing, msg)
 
         case "http_res":
             let reqId = obj["id"] as? String ?? ""

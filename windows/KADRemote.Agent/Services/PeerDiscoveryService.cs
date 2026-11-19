@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
+using System.IO;
 using System.Net;
+using System.Net.Http;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -11,7 +13,8 @@ namespace KADRemote.Agent.Services;
 
 /// <summary>
 /// Exchanges lightweight authenticated LAN beacons among KADRemote agents sharing the same token,
-/// so any single reachable agent over Cloudflare Tunnel can report fresh Tunnel URLs for rebooted LAN peers.
+/// monitors sibling servers in the LAN farm to detect if any running Windows server lost its Kad.exe,
+/// and reports peer Tunnel URLs and ExeMissing alerts to the iPhone controller.
 /// </summary>
 public sealed class PeerDiscoveryService : IDisposable
 {
@@ -21,11 +24,16 @@ public sealed class PeerDiscoveryService : IDisposable
     private readonly string _tokenHash;
     private readonly int _peerPort;
     private readonly ConcurrentDictionary<string, PeerInfoDto> _peers = new();
+    private readonly ConcurrentDictionary<string, int> _deadAgentChecks = new();
+    private readonly HttpClient _probeHttp = new() { Timeout = TimeSpan.FromSeconds(1.6) };
     private readonly CancellationTokenSource _cts = new();
 
     private UdpClient? _listener;
     private Task? _listenTask;
     private Task? _broadcastTask;
+    private Task? _watchdogTask;
+
+    public event Action<PeerInfoDto>? PeerExeAlertDetected;
 
     public PeerDiscoveryService(AgentConfigService config, SystemService system, CloudflareTunnelService tunnel)
     {
@@ -36,6 +44,8 @@ public sealed class PeerDiscoveryService : IDisposable
         _tokenHash = Convert.ToHexString(
             SHA256.HashData(Encoding.UTF8.GetBytes(config.Config.ControllerToken))
         ).ToLowerInvariant();
+
+        LoadPersistedPeers();
     }
 
     public void Start()
@@ -43,7 +53,9 @@ public sealed class PeerDiscoveryService : IDisposable
         if (_listenTask != null) return;
         _listenTask = Task.Run(() => ListenLoopAsync(_cts.Token));
         _broadcastTask = Task.Run(() => BroadcastLoopAsync(_cts.Token));
+        _watchdogTask = Task.Run(() => WatchdogLoopAsync(_cts.Token));
         _tunnel.TunnelUrlChanged += OnTunnelUrlChanged;
+        _config.ExeStatusChanged += OnSelfExeStatusChanged;
     }
 
     private void OnTunnelUrlChanged(string? url)
@@ -51,16 +63,21 @@ public sealed class PeerDiscoveryService : IDisposable
         _ = Task.Run(() => SendBeaconAsync(_cts.Token));
     }
 
+    private void OnSelfExeStatusChanged(bool missing, string? message)
+    {
+        _ = Task.Run(() => SendBeaconAsync(_cts.Token));
+    }
+
     public List<PeerInfoDto> GetPeers()
     {
-        var cutoff = DateTimeOffset.UtcNow.AddSeconds(-120);
+        var cutoff = DateTimeOffset.UtcNow.AddMinutes(-30);
         foreach (var kv in _peers)
         {
-            if (kv.Value.LastSeenUtc < cutoff)
+            if (kv.Value.LastSeenUtc < cutoff && !kv.Value.ExeMissing)
                 _peers.TryRemove(kv.Key, out _);
         }
 
-        // Always include self with freshest info
+        _config.CheckExeHealthNow();
         var (tot, used) = _system.GetMemoryBytes();
         var self = new PeerInfoDto(
             MachineId: _config.MachineId,
@@ -72,7 +89,9 @@ public sealed class PeerDiscoveryService : IDisposable
             TotalMemoryBytes: tot,
             UsedMemoryBytes: used,
             UptimeSeconds: Environment.TickCount64 / 1000,
-            LastSeenUtc: DateTimeOffset.UtcNow
+            LastSeenUtc: DateTimeOffset.UtcNow,
+            ExeMissing: _config.IsExeMissing,
+            ExeStatusMessage: _config.ExeStatusMessage
         );
 
         var list = _peers.Values.Where(p => p.MachineId != _config.MachineId).ToList();
@@ -120,6 +139,9 @@ public sealed class PeerDiscoveryService : IDisposable
                 if (!string.Equals(pkt.TokenHash, _tokenHash, StringComparison.OrdinalIgnoreCase)) continue;
                 if (string.IsNullOrWhiteSpace(pkt.MachineId) || pkt.MachineId == _config.MachineId) continue;
 
+                bool wasMissing = _peers.TryGetValue(pkt.MachineId, out var prev) && prev.ExeMissing;
+                _deadAgentChecks[pkt.MachineId] = 0;
+
                 var info = new PeerInfoDto(
                     MachineId: pkt.MachineId,
                     DeviceName: pkt.DeviceName,
@@ -130,9 +152,17 @@ public sealed class PeerDiscoveryService : IDisposable
                     TotalMemoryBytes: pkt.TotalMemoryBytes,
                     UsedMemoryBytes: pkt.UsedMemoryBytes,
                     UptimeSeconds: pkt.UptimeSeconds,
-                    LastSeenUtc: DateTimeOffset.UtcNow
+                    LastSeenUtc: DateTimeOffset.UtcNow,
+                    ExeMissing: pkt.ExeMissing,
+                    ExeStatusMessage: pkt.ExeStatusMessage
                 );
                 _peers[pkt.MachineId] = info;
+                SavePersistedPeers();
+
+                if (pkt.ExeMissing && !wasMissing)
+                {
+                    PeerExeAlertDetected?.Invoke(info);
+                }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -147,13 +177,118 @@ public sealed class PeerDiscoveryService : IDisposable
         while (!ct.IsCancellationRequested)
         {
             await SendBeaconAsync(ct);
-            try { await Task.Delay(20_000, ct); }
+            try { await Task.Delay(18_000, ct); }
             catch (OperationCanceledException) { break; }
         }
     }
 
+    private async Task WatchdogLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try { await Task.Delay(10_000, ct); }
+            catch (OperationCanceledException) { break; }
+
+            var staleThreshold = DateTimeOffset.UtcNow.AddSeconds(-22);
+            foreach (var kv in _peers)
+            {
+                if (ct.IsCancellationRequested) break;
+                var peer = kv.Value;
+                if (peer.MachineId == _config.MachineId) continue;
+                if (peer.LastSeenUtc >= staleThreshold && !peer.ExeMissing) continue;
+
+                await CheckPeerHealthAsync(peer, ct);
+            }
+        }
+    }
+
+    private async Task CheckPeerHealthAsync(PeerInfoDto peer, CancellationToken ct)
+    {
+        foreach (var rawUrl in peer.LocalUrls)
+        {
+            if (!Uri.TryCreate(rawUrl, UriKind.Absolute, out var uri)) continue;
+            var host = uri.Host;
+            var port = uri.Port > 0 ? uri.Port : peer.AgentPort;
+
+            var (agentAlive, connectionRefused, healthDto) = await ProbePeerAgentAsync(host, port, ct);
+            if (agentAlive)
+            {
+                _deadAgentChecks[peer.MachineId] = 0;
+                var refreshed = peer with
+                {
+                    LastSeenUtc = DateTimeOffset.UtcNow,
+                    ExeMissing = healthDto?.ExeMissing ?? false,
+                    ExeStatusMessage = healthDto?.ExeStatusMessage
+                };
+                _peers[peer.MachineId] = refreshed;
+                if (refreshed.ExeMissing && !peer.ExeMissing)
+                    PeerExeAlertDetected?.Invoke(refreshed);
+                return;
+            }
+
+            bool windowsHostOnline = connectionRefused || await IsWindowsHostAliveOnLanAsync(host, ct);
+            if (windowsHostOnline)
+            {
+                int count = _deadAgentChecks.AddOrUpdate(peer.MachineId, 1, (_, c) => c + 1);
+                if (count >= 2 && !peer.ExeMissing)
+                {
+                    var alertMsg = $"CẢNH BÁO: Máy chủ {peer.DeviceName} ({host}) vẫn đang bật nhưng mất tiến trình Kad.exe (file Kad.exe có thể đã bị mất hoặc bị Windows xóa)!";
+                    var alerted = peer with
+                    {
+                        ExeMissing = true,
+                        ExeStatusMessage = alertMsg
+                    };
+                    _peers[peer.MachineId] = alerted;
+                    SavePersistedPeers();
+                    AgentLog.Warn("PeerWatchdog", alertMsg);
+                    PeerExeAlertDetected?.Invoke(alerted);
+                }
+                return;
+            }
+        }
+    }
+
+    private async Task<(bool alive, bool refused, HealthResponse? health)> ProbePeerAgentAsync(string host, int port, CancellationToken ct)
+    {
+        try
+        {
+            using var resp = await _probeHttp.GetAsync($"http://{host}:{port}/api/health", ct);
+            if (resp.IsSuccessStatusCode)
+            {
+                await using var s = await resp.Content.ReadAsStreamAsync(ct);
+                var health = await JsonSerializer.DeserializeAsync(s, AgentJsonContext.Default.HealthResponse, ct);
+                return (true, false, health);
+            }
+            return (true, false, null);
+        }
+        catch (HttpRequestException ex) when (ex.InnerException is SocketException { SocketErrorCode: SocketError.ConnectionRefused })
+        {
+            // TCP RST from target IP proves the Windows OS is running, but Kad.exe is not listening on AgentPort!
+            return (false, true, null);
+        }
+        catch
+        {
+            return (false, false, null);
+        }
+    }
+
+    private static async Task<bool> IsWindowsHostAliveOnLanAsync(string host, CancellationToken ct)
+    {
+        try
+        {
+            using var ping = new Ping();
+            var reply = await ping.SendPingAsync(host, 750);
+            if (reply.Status == IPStatus.Success)
+                return true;
+        }
+        catch { }
+
+        return false;
+    }
+
     private byte[] BuildBeaconBytes()
     {
+        _config.CheckExeHealthNow();
         var (tot, used) = _system.GetMemoryBytes();
         var pkt = new UdpPeerBeaconPacket(
             Type: "peer_beacon",
@@ -166,7 +301,9 @@ public sealed class PeerDiscoveryService : IDisposable
             CpuUsagePercent: _system.GetCpuUsagePercent(),
             TotalMemoryBytes: tot,
             UsedMemoryBytes: used,
-            UptimeSeconds: Environment.TickCount64 / 1000
+            UptimeSeconds: Environment.TickCount64 / 1000,
+            ExeMissing: _config.IsExeMissing,
+            ExeStatusMessage: _config.ExeStatusMessage
         );
         return JsonSerializer.SerializeToUtf8Bytes(pkt, AgentJsonContext.Default.UdpPeerBeaconPacket);
     }
@@ -217,11 +354,49 @@ public sealed class PeerDiscoveryService : IDisposable
         return targets;
     }
 
+    private static string GetPeersStorePath() => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "KADRemote",
+        "peers.json"
+    );
+
+    private void LoadPersistedPeers()
+    {
+        try
+        {
+            var path = GetPeersStorePath();
+            if (!File.Exists(path)) return;
+            var list = JsonSerializer.Deserialize(File.ReadAllText(path), AgentJsonContext.Default.ListPeerInfoDto);
+            if (list == null) return;
+            foreach (var p in list)
+            {
+                if (!string.IsNullOrWhiteSpace(p.MachineId) && p.MachineId != _config.MachineId)
+                    _peers[p.MachineId] = p;
+            }
+        }
+        catch { }
+    }
+
+    private void SavePersistedPeers()
+    {
+        try
+        {
+            var path = GetPeersStorePath();
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var list = _peers.Values.ToList();
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(list, AgentJsonContext.Default.ListPeerInfoDto);
+            File.WriteAllBytes(path, bytes);
+        }
+        catch { }
+    }
+
     public void Dispose()
     {
         _tunnel.TunnelUrlChanged -= OnTunnelUrlChanged;
+        _config.ExeStatusChanged -= OnSelfExeStatusChanged;
         _cts.Cancel();
         _listener?.Dispose();
+        _probeHttp.Dispose();
         _cts.Dispose();
     }
 }

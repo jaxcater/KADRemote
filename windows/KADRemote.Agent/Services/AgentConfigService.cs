@@ -1,8 +1,6 @@
-using System.Diagnostics;
 using System.IO;
-using System.Runtime.InteropServices;
+using System.Net.Http;
 using System.Security.Cryptography;
-using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using KADRemote.Agent.Models;
@@ -10,27 +8,39 @@ using Microsoft.Win32;
 
 namespace KADRemote.Agent.Services;
 
-public sealed class AgentConfigService
+public sealed class AgentConfigService : IDisposable
 {
-    private const string Magic = "KADCFG01";
+    private const string LegacyMagic = "KADCFG01";
+    private const string SlotPrefix = "KADCFG_SLOT_V2::";
+    private const string SlotResourceName = "KADRemote.ConfigSlot.txt";
     private const string RunRegKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private const string AppRegName = "KADRemote";
-    private const string ScheduledTaskName = "KADRemoteAgent";
     private const int MaxPayloadBytes = 64 * 1024;
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool DeleteFileW(string lpFileName);
+    private readonly List<FileSystemWatcher> _watchers = new();
+    private readonly Timer _healthTimer;
+    private readonly object _healthLock = new();
 
     public EmbeddedAgentConfig Config { get; }
     public bool HasEmbeddedConfig { get; private set; }
     public string MachineId { get; }
     public string DeviceName { get; }
     public string DefaultShellDirectory { get; }
+    public string? PrimaryExePath { get; }
+
+    public bool IsExeMissing { get; private set; }
+    public string? ExeStatusMessage { get; private set; }
+
+    /// <summary>
+    /// Fired immediately whenever Kad.exe missing/deleted state changes on disk.
+    /// </summary>
+    public event Action<bool, string?>? ExeStatusChanged;
 
     public AgentConfigService()
     {
         DeviceName = Environment.MachineName;
         MachineId = ResolveMachineId();
+        PrimaryExePath = Environment.ProcessPath;
 
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         DefaultShellDirectory = Directory.Exists(home) ? home : AppContext.BaseDirectory;
@@ -38,21 +48,25 @@ public sealed class AgentConfigService
         Config = LoadConfig();
         NormalizeConfig();
 
-        StripZoneIdentifier(Environment.ProcessPath);
+        _healthTimer = new Timer(_ => CheckExeHealthNow(), null, Timeout.Infinite, Timeout.Infinite);
     }
+
+    private bool _startupKeyVerified;
 
     public void FinalizeRuntimeSetup()
     {
-        if (HasEmbeddedConfig)
-            SaveConfigBackup();
+        if (!string.IsNullOrWhiteSpace(PrimaryExePath) && File.Exists(PrimaryExePath))
+        {
+            Config.WatchedExePath = PrimaryExePath;
+        }
 
-        if (Config.StartWithWindows)
-            ApplyWindowsStartup(true, Environment.ProcessPath);
-
-        _ = Task.Run(EnsureFirewallRuleIfElevated);
+        SaveConfigBackup();
+        StartExeWatchers();
+        CheckExeHealthNow();
+        _healthTimer.Change(TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(3));
 
         var hosts = string.Join(", ", GetCandidateControllerHosts());
-        AgentLog.Info("Config", $"Startup: MachineId={MachineId}, Device={DeviceName}, Embedded={HasEmbeddedConfig}, AgentPort={Config.AgentPort}, HubPort={Config.ControllerPort}, Hosts=[{hosts}], Udp={Config.UdpDiscovery}, Tunnel={Config.EnableCloudflareTunnel}, CloudSync={Config.EnableCloudSync}");
+        AgentLog.Info("Config", $"Startup: MachineId={MachineId}, Device={DeviceName}, Embedded={HasEmbeddedConfig}, Exe={PrimaryExePath}, AgentPort={Config.AgentPort}, HubPort={Config.ControllerPort}, Hosts=[{hosts}], Udp={Config.UdpDiscovery}, Tunnel={Config.EnableCloudflareTunnel}, CloudSync={Config.EnableCloudSync}");
     }
 
     public List<string> GetCandidateControllerHosts()
@@ -73,124 +87,114 @@ public sealed class AgentConfigService
         return list;
     }
 
-    /// <summary>
-    /// When launched from a downloaded/shared Kad.exe (e.g. Downloads/Desktop) with StartWithWindows enabled,
-    /// copies itself to %LocalAppData%\KADRemote\KadAgent.exe, strips MOTW, registers auto-start, and launches the installed copy
-    /// so the user can move/delete the original file and the agent survives reboots on Windows 10/11/Server.
-    /// Returns true if relaunched and the current process should exit.
-    /// </summary>
-    public bool TrySelfInstallAndRelaunch()
+    public void RequestExistingInstanceShutdown()
     {
-        if (!Config.StartWithWindows) return false;
-
-        var currentExe = Environment.ProcessPath;
-        if (string.IsNullOrWhiteSpace(currentExe) || !File.Exists(currentExe))
-            return false;
-
-        var installDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "KADRemote"
-        );
-        var installedExe = Path.Combine(installDir, "KadAgent.exe");
-        var legacyInstalledExe = Path.Combine(installDir, "Kad.exe");
-
-        if (string.Equals(Path.GetFullPath(currentExe), Path.GetFullPath(installedExe), StringComparison.OrdinalIgnoreCase))
-            return false;
-
         try
         {
-            Directory.CreateDirectory(installDir);
-
-            StopExistingAgentInstances(installedExe, legacyInstalledExe);
-
-            // Copy with brief retry in case file handle is still releasing
-            for (int attempt = 0; attempt < 6; attempt++)
-            {
-                try
-                {
-                    File.Copy(currentExe, installedExe, overwrite: true);
-                    break;
-                }
-                catch when (attempt < 5)
-                {
-                    Thread.Sleep(350);
-                }
-            }
-
-            if (HasEmbeddedConfig)
-                SaveConfigBackup();
-
-            StripZoneIdentifier(installedExe);
-            ApplyWindowsStartup(true, installedExe);
-
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = installedExe,
-                WorkingDirectory = installDir,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            });
-
-            AgentLog.Info("Install", $"Self-installed and relaunched from {installedExe}");
-            return true;
+            using var http = new HttpClient { Timeout = TimeSpan.FromMilliseconds(1200) };
+            using var resp = http.PostAsync($"http://127.0.0.1:{Config.AgentPort}/api/agent/shutdown", null).GetAwaiter().GetResult();
+            if (resp.IsSuccessStatusCode)
+                Thread.Sleep(450);
         }
-        catch (Exception ex)
+        catch { }
+    }
+
+    private void StartExeWatchers()
+    {
+        var dirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (!string.IsNullOrWhiteSpace(PrimaryExePath))
         {
-            AgentLog.Warn("Install", $"Self-install fallback to current path ({currentExe}): {ex.Message}");
-            if (HasEmbeddedConfig)
-                SaveConfigBackup();
-            ApplyWindowsStartup(true, currentExe);
-            return false;
+            var d = Path.GetDirectoryName(PrimaryExePath);
+            if (!string.IsNullOrWhiteSpace(d) && Directory.Exists(d))
+                dirs.Add(d);
+        }
+
+        if (!string.IsNullOrWhiteSpace(Config.WatchedExePath))
+        {
+            var d = Path.GetDirectoryName(Config.WatchedExePath);
+            if (!string.IsNullOrWhiteSpace(d) && Directory.Exists(d))
+                dirs.Add(d);
+        }
+
+        foreach (var dir in dirs)
+        {
+            try
+            {
+                var fsw = new FileSystemWatcher(dir, "*.exe")
+                {
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.CreationTime | NotifyFilters.LastWrite | NotifyFilters.Size,
+                    IncludeSubdirectories = false,
+                    EnableRaisingEvents = true
+                };
+                fsw.Deleted += (_, _) => CheckExeHealthNow();
+                fsw.Renamed += (_, _) => CheckExeHealthNow();
+                fsw.Created += (_, _) => CheckExeHealthNow();
+                _watchers.Add(fsw);
+            }
+            catch { }
         }
     }
 
-    public void StopExistingAgentInstances(string? installedExe = null, string? legacyInstalledExe = null)
+    public void CheckExeHealthNow()
     {
-        var installDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "KADRemote"
-        );
-        installedExe ??= Path.Combine(installDir, "KadAgent.exe");
-        legacyInstalledExe ??= Path.Combine(installDir, "Kad.exe");
+        bool missing = false;
+        string? missingPath = null;
 
-        // 1. Ask any running local agent on AgentPort to shut down gracefully (works even across privilege levels!)
-        try
+        if (!string.IsNullOrWhiteSpace(PrimaryExePath) && !File.Exists(PrimaryExePath))
         {
-            using var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromMilliseconds(900) };
-            using var resp = http.PostAsync($"http://127.0.0.1:{Config.AgentPort}/api/agent/shutdown", null).GetAwaiter().GetResult();
-            if (resp.IsSuccessStatusCode)
-                Thread.Sleep(400);
+            missing = true;
+            missingPath = PrimaryExePath;
         }
-        catch { }
-
-        // 2. Terminate remaining KadAgent / Kad processes running from LocalAppData\KADRemote
-        foreach (var procName in new[] { "KadAgent", "Kad" })
+        else if (!string.IsNullOrWhiteSpace(Config.WatchedExePath) && !File.Exists(Config.WatchedExePath))
         {
-            foreach (var proc in Process.GetProcessesByName(procName))
+            missing = true;
+            missingPath = Config.WatchedExePath;
+        }
+        else if (Config.StartWithWindows)
+        {
+            var regTarget = GetRegisteredStartupExePath();
+            if (!string.IsNullOrWhiteSpace(regTarget) && !File.Exists(regTarget))
             {
-                try
-                {
-                    if (proc.Id == Environment.ProcessId) continue;
-                    string? procPath = null;
-                    try { procPath = proc.MainModule?.FileName; } catch { }
-
-                    bool shouldKill = procName.Equals("KadAgent", StringComparison.OrdinalIgnoreCase);
-                    if (!shouldKill && procPath != null)
-                    {
-                        var fullProc = Path.GetFullPath(procPath);
-                        shouldKill = string.Equals(fullProc, Path.GetFullPath(installedExe), StringComparison.OrdinalIgnoreCase)
-                            || string.Equals(fullProc, Path.GetFullPath(legacyInstalledExe), StringComparison.OrdinalIgnoreCase);
-                    }
-
-                    if (shouldKill)
-                    {
-                        proc.Kill(entireProcessTree: true);
-                        proc.WaitForExit(2500);
-                    }
-                }
-                catch { }
-                finally { proc.Dispose(); }
+                missing = true;
+                missingPath = regTarget;
             }
+        }
+
+        string? message = missing
+            ? $"CẢNH BÁO: File Kad.exe trên máy {DeviceName} đã bị mất hoặc bị Windows xóa tại: {missingPath}"
+            : null;
+
+        bool changed = false;
+        lock (_healthLock)
+        {
+            if (IsExeMissing != missing || !string.Equals(ExeStatusMessage, message, StringComparison.Ordinal))
+            {
+                IsExeMissing = missing;
+                ExeStatusMessage = message;
+                changed = true;
+            }
+        }
+
+        if (!missing && Config.StartWithWindows && !string.IsNullOrWhiteSpace(PrimaryExePath) && File.Exists(PrimaryExePath))
+        {
+            // Ensure startup key stays healthy after startup or if file was restored
+            if (changed || !_startupKeyVerified)
+            {
+                _startupKeyVerified = true;
+                SetRunRegistryKey(true, PrimaryExePath);
+            }
+        }
+
+        if (changed)
+        {
+            if (missing)
+                AgentLog.Warn("ExeHealth", message ?? "Kad.exe missing on disk!");
+            else
+                AgentLog.Info("ExeHealth", "Kad.exe file verified present on disk.");
+
+            try { ExeStatusChanged?.Invoke(missing, message); }
+            catch { }
         }
     }
 
@@ -212,16 +216,32 @@ public sealed class AgentConfigService
 
     private EmbeddedAgentConfig LoadConfig()
     {
+        var previousSaved = LoadLocalSavedConfig();
+
+        // 1. Check in-place embedded resource slot (V2 - PE safe, zero EOF overlay)
+        var slotConfig = TryReadEmbeddedResourceSlot();
+        if (slotConfig != null)
+        {
+            HasEmbeddedConfig = true;
+            if (string.IsNullOrWhiteSpace(slotConfig.WatchedExePath))
+                slotConfig.WatchedExePath = previousSaved?.WatchedExePath;
+            return slotConfig;
+        }
+
         var exePath = Environment.ProcessPath;
         if (!string.IsNullOrEmpty(exePath) && File.Exists(exePath))
         {
-            var embedded = TryReadEmbeddedTrailer(exePath);
-            if (embedded != null)
+            // 2. Check in-place slot directly in file bytes or legacy trailer
+            var fileSlot = TryReadFileSlot(exePath) ?? TryReadEmbeddedTrailer(exePath);
+            if (fileSlot != null)
             {
                 HasEmbeddedConfig = true;
-                return embedded;
+                if (string.IsNullOrWhiteSpace(fileSlot.WatchedExePath))
+                    fileSlot.WatchedExePath = previousSaved?.WatchedExePath;
+                return fileSlot;
             }
 
+            // 3. Check sidecar kad_config.json
             var sidecar = Path.Combine(Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory, "kad_config.json");
             if (File.Exists(sidecar))
             {
@@ -234,6 +254,15 @@ public sealed class AgentConfigService
             }
         }
 
+        // 4. Fallback to saved %LocalAppData%\KADRemote\agent.json
+        if (previousSaved != null)
+            return previousSaved;
+
+        return new EmbeddedAgentConfig();
+    }
+
+    private static EmbeddedAgentConfig? LoadLocalSavedConfig()
+    {
         var localPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "KADRemote",
@@ -243,13 +272,76 @@ public sealed class AgentConfigService
         {
             try
             {
-                var cfg = JsonSerializer.Deserialize(File.ReadAllText(localPath), AgentJsonContext.Default.EmbeddedAgentConfig);
-                if (cfg != null) return cfg;
+                return JsonSerializer.Deserialize(File.ReadAllText(localPath), AgentJsonContext.Default.EmbeddedAgentConfig);
             }
             catch { }
         }
+        return null;
+    }
 
-        return new EmbeddedAgentConfig();
+    private static EmbeddedAgentConfig? TryReadEmbeddedResourceSlot()
+    {
+        try
+        {
+            using var stream = typeof(AgentConfigService).Assembly.GetManifestResourceStream(SlotResourceName);
+            if (stream == null) return null;
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+            var raw = reader.ReadToEnd();
+            if (!raw.StartsWith(SlotPrefix, StringComparison.Ordinal))
+                return null;
+
+            var payload = raw[SlotPrefix.Length..].Trim();
+            return ParseSlotPayload(payload);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static EmbeddedAgentConfig? TryReadFileSlot(string exePath)
+    {
+        try
+        {
+            var bytes = File.ReadAllBytes(exePath);
+            var marker = Encoding.ASCII.GetBytes(SlotPrefix);
+            int idx = bytes.AsSpan().IndexOf(marker);
+            if (idx < 0) return null;
+
+            int start = idx + marker.Length;
+            int maxLen = Math.Min(16384 - marker.Length, bytes.Length - start);
+            if (maxLen <= 2) return null;
+
+            var payload = Encoding.UTF8.GetString(bytes, start, maxLen).Trim();
+            return ParseSlotPayload(payload);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static EmbeddedAgentConfig? ParseSlotPayload(string payload)
+    {
+        if (string.IsNullOrEmpty(payload))
+            return null;
+
+        if (payload.StartsWith("B64:", StringComparison.Ordinal))
+        {
+            var b64 = payload[4..].Trim();
+            int spaceIdx = b64.IndexOfAny(new[] { ' ', '\0', '\r', '\n' });
+            if (spaceIdx > 0)
+                b64 = b64[..spaceIdx];
+            var decoded = Convert.FromBase64String(b64);
+            return JsonSerializer.Deserialize(decoded, AgentJsonContext.Default.EmbeddedAgentConfig);
+        }
+
+        if (payload.StartsWith('{'))
+        {
+            return JsonSerializer.Deserialize(payload, AgentJsonContext.Default.EmbeddedAgentConfig);
+        }
+
+        return null;
     }
 
     private void NormalizeConfig()
@@ -280,7 +372,7 @@ public sealed class AgentConfigService
             fs.Seek(-8, SeekOrigin.End);
             fs.ReadExactly(magicBuf);
 
-            var expectedMagic = Encoding.ASCII.GetBytes(Magic);
+            var expectedMagic = Encoding.ASCII.GetBytes(LegacyMagic);
             if (!magicBuf.SequenceEqual(expectedMagic))
                 return null;
 
@@ -301,13 +393,6 @@ public sealed class AgentConfigService
         {
             return null;
         }
-    }
-
-    private static void StripZoneIdentifier(string? filePath)
-    {
-        if (string.IsNullOrWhiteSpace(filePath)) return;
-        try { DeleteFileW(filePath + ":Zone.Identifier"); }
-        catch { }
     }
 
     private static string ResolveMachineId()
@@ -346,55 +431,6 @@ public sealed class AgentConfigService
         }
     }
 
-    private static bool IsElevated()
-    {
-        try
-        {
-            using var identity = WindowsIdentity.GetCurrent();
-            return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static void ApplyWindowsStartup(bool enabled, string? exePath)
-    {
-        if (string.IsNullOrWhiteSpace(exePath)) return;
-
-        if (enabled && IsElevated() && TryRegisterElevatedScheduledTask(exePath))
-        {
-            // Task Scheduler ONLOGON with HIGHEST privilege handles startup without UAC; remove Run key to avoid double-launch
-            SetRunRegistryKey(false, exePath);
-            return;
-        }
-
-        SetRunRegistryKey(enabled, exePath);
-    }
-
-    private static bool TryRegisterElevatedScheduledTask(string exePath)
-    {
-        try
-        {
-            using var proc = Process.Start(new ProcessStartInfo
-            {
-                FileName = "schtasks.exe",
-                Arguments = $"/Create /TN \"{ScheduledTaskName}\" /TR \"\\\"{exePath}\\\"\" /SC ONLOGON /RL HIGHEST /F",
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            });
-            proc?.WaitForExit(5000);
-            return proc is { ExitCode: 0 };
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
     private static void SetRunRegistryKey(bool enabled, string exePath)
     {
         try
@@ -410,49 +446,34 @@ public sealed class AgentConfigService
         catch { }
     }
 
-    private void EnsureFirewallRuleIfElevated()
+    private static string? GetRegisteredStartupExePath()
     {
         try
         {
-            if (!IsElevated())
-                return;
-
-            int port = Config.AgentPort;
-            int peerPort = Math.Clamp(Config.ControllerPort + 1, 1025, 65535);
-            EnsureNetshFirewallRule($"KADRemote-TCP-{port}", "TCP", port);
-            EnsureNetshFirewallRule($"KADRemote-UDP-{peerPort}", "UDP", peerPort);
+            using var key = Registry.CurrentUser.OpenSubKey(RunRegKey, writable: false);
+            var raw = key?.GetValue(AppRegName)?.ToString()?.Trim();
+            if (string.IsNullOrWhiteSpace(raw)) return null;
+            if (raw.StartsWith('"'))
+            {
+                int endQuote = raw.IndexOf('"', 1);
+                if (endQuote > 1)
+                    return raw[1..endQuote];
+            }
+            return raw.Split(' ')[0];
         }
-        catch { }
+        catch
+        {
+            return null;
+        }
     }
 
-    private static void EnsureNetshFirewallRule(string ruleName, string protocol, int port)
+    public void Dispose()
     {
-        try
+        _healthTimer.Dispose();
+        foreach (var w in _watchers)
         {
-            using var check = Process.Start(new ProcessStartInfo
-            {
-                FileName = "netsh",
-                Arguments = $"advfirewall firewall show rule name=\"{ruleName}\"",
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            });
-            check?.WaitForExit(3000);
-            if (check is { ExitCode: 0 })
-                return;
-
-            using var add = Process.Start(new ProcessStartInfo
-            {
-                FileName = "netsh",
-                Arguments = $"advfirewall firewall add rule name=\"{ruleName}\" dir=in action=allow protocol={protocol} localport={port} profile=any",
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            });
-            add?.WaitForExit(3000);
+            try { w.Dispose(); } catch { }
         }
-        catch { }
+        _watchers.Clear();
     }
 }

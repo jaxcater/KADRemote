@@ -152,7 +152,14 @@ public sealed class SystemService
             .ToList();
     }
 
-    public SystemInfoDto GetSystemInfo(string deviceName, int port, string? tunnelUrl = null, string? machineId = null)
+    public SystemInfoDto GetSystemInfo(
+        string deviceName,
+        int port,
+        string? tunnelUrl = null,
+        string? machineId = null,
+        bool exeMissing = false,
+        string? exeStatusMessage = null,
+        string? exePath = null)
     {
         var (totalMem, usedMem) = GetMemoryBytes();
         var disks = new List<DiskInfoDto>();
@@ -186,7 +193,10 @@ public sealed class SystemService
             Disks: disks,
             LocalUrls: GetLocalUrls(port),
             TunnelUrl: tunnelUrl,
-            MachineId: machineId
+            MachineId: machineId,
+            ExeMissing: exeMissing,
+            ExeStatusMessage: exeStatusMessage,
+            ExePath: exePath
         );
     }
 
