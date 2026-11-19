@@ -9,6 +9,9 @@ final class ConnectionStore: ObservableObject {
     @Published var isConnecting: Bool = false
     @Published var errorMessage: String?
     @Published var relayMachineIds: Set<String> = []
+    @Published var tunnelActiveIds: Set<UUID> = []
+    @Published var remoteOnlineIds: Set<UUID> = []
+    @Published var isRefreshingStatuses: Bool = false
 
     private let pcsKey = "kad_saved_pcs_v1"
     private let activeIdKey = "kad_active_pc_id_v1"
@@ -19,7 +22,8 @@ final class ConnectionStore: ObservableObject {
     var client: APIClient? {
         guard let pc = activePC else { return nil }
         let useRelay = pc.machineId.map { relayMachineIds.contains($0) } ?? false
-        return APIClient(pc: pc, hub: hub, preferRelay: useRelay)
+        let useTunnel = tunnelActiveIds.contains(pc.id)
+        return APIClient(pc: pc, hub: hub, preferRelay: useRelay, preferTunnel: useTunnel)
     }
 
     init() {
@@ -36,15 +40,19 @@ final class ConnectionStore: ObservableObject {
             }
         }
 
+        hub.onAgentHeartbeat = { [weak self] status in
+            Task { @MainActor [weak self] in
+                self?.handleAgentHeartbeat(status)
+            }
+        }
+
         hub.onAgentDisconnected = { [weak self] machineId, name in
             Task { @MainActor [weak self] in
                 self?.backgroundManager?.notifyIfInBackground(
                     title: "KAD Remote",
-                    body: "\(name) đã ngắt kết nối khỏi Hub."
+                    body: "\(name) đã ngắt kết nối khỏi Hub LAN."
                 )
-                if self?.activePC?.machineId == machineId {
-                    // Keep saved, relay will resume when agent reconnects
-                }
+                let _ = machineId
             }
         }
     }
@@ -83,6 +91,10 @@ final class ConnectionStore: ObservableObject {
             var existing = savedPCs[idx]
             existing.name = status.deviceName
             existing.url = bestUrl
+            existing.localUrls = status.localUrls
+            if let t = status.tunnelUrl, !t.isEmpty {
+                existing.tunnelUrl = t
+            }
             existing.token = token
             existing.machineId = status.machineId
             existing.isAutoDiscovered = true
@@ -104,7 +116,9 @@ final class ConnectionStore: ObservableObject {
                 isAutoDiscovered: true,
                 lastSeenCpu: status.cpuUsagePercent,
                 lastSeenUsedRam: status.usedMemoryBytes,
-                lastSeenTotalRam: status.totalMemoryBytes
+                lastSeenTotalRam: status.totalMemoryBytes,
+                tunnelUrl: status.tunnelUrl,
+                localUrls: status.localUrls
             )
             savedPCs.insert(newPC, at: 0)
             backgroundManager?.notifyIfInBackground(
@@ -115,9 +129,65 @@ final class ConnectionStore: ObservableObject {
         save()
     }
 
+    func handleAgentHeartbeat(_ status: AgentLiveStatus) {
+        guard let idx = savedPCs.firstIndex(where: { $0.machineId == status.machineId }) else { return }
+        var existing = savedPCs[idx]
+        var changed = false
+
+        if let t = status.tunnelUrl, !t.isEmpty, existing.tunnelUrl != t {
+            existing.tunnelUrl = t
+            changed = true
+        }
+        if !status.localUrls.isEmpty, existing.localUrls != status.localUrls {
+            existing.localUrls = status.localUrls
+            changed = true
+        }
+        existing.lastSeenCpu = status.cpuUsagePercent
+        existing.lastSeenUsedRam = status.usedMemoryBytes
+        existing.lastSeenTotalRam = status.totalMemoryBytes
+        savedPCs[idx] = existing
+
+        if activePC?.id == existing.id {
+            activePC = existing
+        }
+        if changed {
+            save()
+        }
+    }
+
+    func updatePCMetadata(from info: SystemInfo, for pcId: UUID) {
+        guard let idx = savedPCs.firstIndex(where: { $0.id == pcId }) else { return }
+        var pc = savedPCs[idx]
+        var changed = false
+        if let t = info.tunnelUrl, !t.isEmpty, pc.tunnelUrl != t {
+            pc.tunnelUrl = t
+            changed = true
+        }
+        if !info.localUrls.isEmpty, pc.localUrls != info.localUrls {
+            pc.localUrls = info.localUrls
+            changed = true
+        }
+        if changed {
+            savedPCs[idx] = pc
+            if activePC?.id == pc.id {
+                activePC = pc
+            }
+            save()
+        }
+    }
+
     func isAgentOnline(_ pc: SavedPC) -> Bool {
-        guard let mid = pc.machineId else { return false }
-        return hub?.onlineAgents[mid] != nil
+        if let mid = pc.machineId, hub?.onlineAgents[mid] != nil {
+            return true
+        }
+        return remoteOnlineIds.contains(pc.id)
+    }
+
+    func isUsingTunnel(_ pc: SavedPC) -> Bool {
+        if let mid = pc.machineId, hub?.onlineAgents[mid] != nil {
+            return false
+        }
+        return tunnelActiveIds.contains(pc.id) || (remoteOnlineIds.contains(pc.id) && pc.normalizedTunnelUrl != nil)
     }
 
     func liveStatus(for pc: SavedPC) -> AgentLiveStatus? {
@@ -125,24 +195,155 @@ final class ConnectionStore: ObservableObject {
         return hub?.onlineAgents[mid]
     }
 
+    func refreshRemoteStatuses() async {
+        guard !savedPCs.isEmpty else { return }
+        isRefreshingStatuses = true
+        defer { isRefreshingStatuses = false }
+
+        var onlineRemote: Set<UUID> = []
+        var tunnelReachable: [SavedPC] = []
+
+        await withTaskGroup(of: (UUID, Bool, Bool).self) { group in
+            for pc in savedPCs {
+                group.addTask {
+                    let client = APIClient(pc: pc)
+                    if (try? await client.pingSpecificBase(pc.normalizedUrl, timeout: 1.2)) != nil {
+                        return (pc.id, true, false)
+                    }
+                    if let tunnel = pc.normalizedTunnelUrl,
+                       (try? await client.pingSpecificBase(tunnel, timeout: 3.0)) != nil {
+                        return (pc.id, true, true)
+                    }
+                    return (pc.id, false, false)
+                }
+            }
+
+            for await (id, ok, viaTunnel) in group {
+                if ok {
+                    onlineRemote.insert(id)
+                    if viaTunnel {
+                        tunnelActiveIds.insert(id)
+                    } else {
+                        tunnelActiveIds.remove(id)
+                    }
+                    if let pc = savedPCs.first(where: { $0.id == id }), viaTunnel {
+                        tunnelReachable.append(pc)
+                    }
+                }
+            }
+        }
+
+        remoteOnlineIds = onlineRemote
+
+        // Sync fresh Tunnel URLs of any rebooted LAN peers from the first reachable Tunnel PC
+        if let gateway = tunnelReachable.first {
+            await syncPeers(via: gateway)
+        }
+    }
+
+    private func syncPeers(via gateway: SavedPC) async {
+        let client = APIClient(pc: gateway, preferTunnel: true)
+        guard let peers = try? await client.getPeers() else { return }
+
+        var updatedAny = false
+        for peer in peers {
+            if let idx = savedPCs.firstIndex(where: { $0.machineId == peer.machineId }) {
+                var pc = savedPCs[idx]
+                if let t = peer.tunnelUrl, !t.isEmpty, pc.tunnelUrl != t {
+                    pc.tunnelUrl = t
+                    updatedAny = true
+                }
+                if !peer.localUrls.isEmpty {
+                    pc.localUrls = peer.localUrls
+                }
+                pc.lastSeenCpu = peer.cpuUsagePercent
+                pc.lastSeenUsedRam = peer.usedMemoryBytes
+                pc.lastSeenTotalRam = peer.totalMemoryBytes
+                savedPCs[idx] = pc
+                if pc.normalizedTunnelUrl != nil {
+                    remoteOnlineIds.insert(pc.id)
+                    tunnelActiveIds.insert(pc.id)
+                }
+            } else if let t = peer.tunnelUrl, !t.isEmpty {
+                let newPC = SavedPC(
+                    name: peer.deviceName,
+                    url: peer.localUrls.first ?? t,
+                    token: gateway.token,
+                    lastConnected: Date(),
+                    machineId: peer.machineId,
+                    isAutoDiscovered: true,
+                    lastSeenCpu: peer.cpuUsagePercent,
+                    lastSeenUsedRam: peer.usedMemoryBytes,
+                    lastSeenTotalRam: peer.totalMemoryBytes,
+                    tunnelUrl: t,
+                    localUrls: peer.localUrls
+                )
+                savedPCs.append(newPC)
+                remoteOnlineIds.insert(newPC.id)
+                tunnelActiveIds.insert(newPC.id)
+                updatedAny = true
+            }
+        }
+        if updatedAny {
+            save()
+        }
+    }
+
     func reconnectActive() async {
-        guard let pc = activePC else { return }
+        guard var pc = activePC else { return }
         isConnecting = true
         errorMessage = nil
 
-        // Check direct connectivity first if machine has a live hub session, so we know whether to use fast direct LAN or firewall-bypass relay
-        if let mid = pc.machineId, hub?.hasActiveSession(machineId: mid) == true {
-            let directClient = APIClient(pc: pc, hub: hub, preferRelay: false)
-            if let _ = try? await directClient.pingDirectOnly(timeout: 1.5) {
-                relayMachineIds.remove(mid)
-            } else {
-                relayMachineIds.insert(mid)
+        let probe = APIClient(pc: pc, hub: hub)
+        var resolvedRoute = false
+
+        // 1. Try direct LAN first (fastest)
+        if (try? await probe.pingSpecificBase(pc.normalizedUrl, timeout: 1.5)) != nil {
+            tunnelActiveIds.remove(pc.id)
+            if let mid = pc.machineId { relayMachineIds.remove(mid) }
+            resolvedRoute = true
+        }
+        // 2. Try active LAN Hub Relay if firewalled
+        else if let mid = pc.machineId, hub?.hasActiveSession(machineId: mid) == true {
+            relayMachineIds.insert(mid)
+            tunnelActiveIds.remove(pc.id)
+            resolvedRoute = true
+        }
+        // 3. Try saved Cloudflare Tunnel URL (when away from home / 4G)
+        else if let tunnel = pc.normalizedTunnelUrl,
+                (try? await probe.pingSpecificBase(tunnel, timeout: 3.5)) != nil {
+            tunnelActiveIds.insert(pc.id)
+            if let mid = pc.machineId { relayMachineIds.remove(mid) }
+            resolvedRoute = true
+        }
+        // 4. If Tunnel URL rotated after reboot, ask any other reachable PC on LAN via /api/peers
+        else {
+            for other in savedPCs where other.id != pc.id {
+                if let otherTunnel = other.normalizedTunnelUrl,
+                   (try? await APIClient(pc: other).pingSpecificBase(otherTunnel, timeout: 2.5)) != nil {
+                    await syncPeers(via: other)
+                    if let refreshed = savedPCs.first(where: { $0.id == pc.id }) {
+                        pc = refreshed
+                        activePC = refreshed
+                    }
+                    if let newTunnel = pc.normalizedTunnelUrl,
+                       (try? await APIClient(pc: pc).pingSpecificBase(newTunnel, timeout: 3.5)) != nil {
+                        tunnelActiveIds.insert(pc.id)
+                        resolvedRoute = true
+                        break
+                    }
+                }
             }
+        }
+
+        if !resolvedRoute && pc.normalizedTunnelUrl != nil {
+            tunnelActiveIds.insert(pc.id)
         }
 
         do {
             let useRelay = pc.machineId.map { relayMachineIds.contains($0) } ?? false
-            let resp = try await APIClient(pc: pc, hub: hub, preferRelay: useRelay).ping()
+            let useTunnel = tunnelActiveIds.contains(pc.id)
+            let resp = try await APIClient(pc: pc, hub: hub, preferRelay: useRelay, preferTunnel: useTunnel).ping()
             var updated = pc
             if !resp.deviceName.isEmpty {
                 updated.name = resp.deviceName
@@ -150,6 +351,7 @@ final class ConnectionStore: ObservableObject {
             updated.lastConnected = Date()
             upsertPC(updated)
             activePC = updated
+            remoteOnlineIds.insert(updated.id)
             isConnected = true
         } catch {
             isConnected = false
@@ -162,19 +364,38 @@ final class ConnectionStore: ObservableObject {
         isConnecting = true
         errorMessage = nil
 
+        let trimmedUrl = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isTunnel = trimmedUrl.lowercased().contains("trycloudflare.com") || trimmedUrl.lowercased().hasPrefix("https://")
+
         var candidate = SavedPC(
             name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "My PC" : name,
-            url: url,
+            url: trimmedUrl,
             token: token.trimmingCharacters(in: .whitespacesAndNewlines),
-            lastConnected: Date()
+            lastConnected: Date(),
+            tunnelUrl: isTunnel ? trimmedUrl : nil
         )
 
         do {
-            let pingResp = try await APIClient(pc: candidate, hub: hub).ping()
+            let client = APIClient(pc: candidate, hub: hub, preferTunnel: isTunnel)
+            let pingResp = try await client.ping()
             if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !pingResp.deviceName.isEmpty {
                 candidate.name = pingResp.deviceName
             }
+            if let sysInfo = try? await client.getSystemInfo() {
+                if let t = sysInfo.tunnelUrl, !t.isEmpty {
+                    candidate.tunnelUrl = t
+                }
+                if !sysInfo.localUrls.isEmpty {
+                    candidate.localUrls = sysInfo.localUrls
+                    if isTunnel, let firstLan = sysInfo.localUrls.first {
+                        candidate.url = firstLan
+                    }
+                }
+            }
             upsertPC(candidate)
+            if isTunnel {
+                tunnelActiveIds.insert(candidate.id)
+            }
             activePC = candidate
             isConnected = true
             isConnecting = false
@@ -201,6 +422,8 @@ final class ConnectionStore: ObservableObject {
 
     func deletePC(_ pc: SavedPC) {
         savedPCs.removeAll { $0.id == pc.id }
+        tunnelActiveIds.remove(pc.id)
+        remoteOnlineIds.remove(pc.id)
         if activePC?.id == pc.id {
             activePC = nil
             isConnected = false
@@ -210,10 +433,18 @@ final class ConnectionStore: ObservableObject {
 
     private func upsertPC(_ pc: SavedPC) {
         if let idx = savedPCs.firstIndex(where: {
-            ($0.machineId != nil && $0.machineId == pc.machineId) || $0.normalizedUrl == pc.normalizedUrl
+            ($0.machineId != nil && $0.machineId == pc.machineId)
+            || $0.normalizedUrl == pc.normalizedUrl
+            || ($0.normalizedTunnelUrl != nil && $0.normalizedTunnelUrl == pc.normalizedTunnelUrl)
         }) {
             var existing = pc
             existing.id = savedPCs[idx].id
+            if existing.tunnelUrl == nil {
+                existing.tunnelUrl = savedPCs[idx].tunnelUrl
+            }
+            if existing.localUrls == nil {
+                existing.localUrls = savedPCs[idx].localUrls
+            }
             savedPCs[idx] = existing
             activePC = existing
         } else {

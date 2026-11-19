@@ -146,11 +146,24 @@ struct ConnectView: View {
                                 Text("Máy tính & Server (\(store.savedPCs.count))")
                                     .font(.headline)
                                 Spacer()
+                                Button {
+                                    Task { await store.refreshRemoteStatuses() }
+                                } label: {
+                                    if store.isRefreshingStatuses {
+                                        ProgressView()
+                                            .scaleEffect(0.8)
+                                    } else {
+                                        Label("Kiểm tra", systemImage: "arrow.clockwise")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundColor(.cyan)
+                                    }
+                                }
                             }
 
                             ForEach(store.savedPCs) { pc in
                                 let live = store.liveStatus(for: pc)
-                                let isOnline = live != nil
+                                let isOnline = store.isAgentOnline(pc)
+                                let viaTunnel = store.isUsingTunnel(pc)
 
                                 HStack {
                                     Button {
@@ -160,9 +173,9 @@ struct ConnectView: View {
                                             ZStack(alignment: .bottomTrailing) {
                                                 Image(systemName: pc.isAutoDiscovered == true ? "server.rack" : "desktopcomputer")
                                                     .font(.title2)
-                                                    .foregroundColor(isOnline ? .green : .cyan)
+                                                    .foregroundColor(isOnline ? (viaTunnel ? .cyan : .green) : .cyan)
                                                 Circle()
-                                                    .fill(isOnline ? Color.green : Color.gray)
+                                                    .fill(isOnline ? (viaTunnel ? Color.cyan : Color.green) : Color.gray)
                                                     .frame(width: 9, height: 9)
                                                     .offset(x: 2, y: 2)
                                             }
@@ -172,17 +185,30 @@ struct ConnectView: View {
                                                         .font(.headline)
                                                         .foregroundColor(.primary)
                                                     if isOnline {
-                                                        Text("ONLINE")
+                                                        Text(viaTunnel ? "TUNNEL 4G" : "LAN")
                                                             .font(.system(size: 9, weight: .bold))
                                                             .padding(.horizontal, 5)
                                                             .padding(.vertical, 2)
-                                                            .background(Color.green.opacity(0.2))
-                                                            .foregroundColor(.green)
+                                                            .background((viaTunnel ? Color.cyan : Color.green).opacity(0.2))
+                                                            .foregroundColor(viaTunnel ? .cyan : .green)
+                                                            .cornerRadius(4)
+                                                    } else if pc.normalizedTunnelUrl != nil {
+                                                        Text("4G SẴN SÀNG")
+                                                            .font(.system(size: 9, weight: .bold))
+                                                            .padding(.horizontal, 5)
+                                                            .padding(.vertical, 2)
+                                                            .background(Color.blue.opacity(0.2))
+                                                            .foregroundColor(.blue)
                                                             .cornerRadius(4)
                                                     }
                                                 }
                                                 if let live {
                                                     Text("CPU \(String(format: "%.0f", live.cpuUsagePercent))% • RAM \(ByteFormatter.format(live.usedMemoryBytes))/\(ByteFormatter.format(live.totalMemoryBytes))")
+                                                        .font(.caption)
+                                                        .foregroundColor(.secondary)
+                                                        .lineLimit(1)
+                                                } else if let tunnel = pc.normalizedTunnelUrl {
+                                                    Text(viaTunnel ? tunnel : "\(pc.normalizedUrl) • \(tunnel)")
                                                         .font(.caption)
                                                         .foregroundColor(.secondary)
                                                         .lineLimit(1)
@@ -273,6 +299,12 @@ struct ConnectView: View {
             }
             .navigationTitle("Kết nối")
             .navigationBarTitleDisplayMode(.inline)
+            .refreshable {
+                await store.refreshRemoteStatuses()
+            }
+            .task {
+                await store.refreshRemoteStatuses()
+            }
             .sheet(isPresented: $showScanner) {
                 QRScannerView { raw in
                     if let parsed = store.handleQRString(raw) {

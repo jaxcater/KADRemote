@@ -74,14 +74,34 @@ final class KADWebSocketClient {
 
 final class APIClient {
     let baseURL: String
+    let fallbackURLs: [String]
     let token: String
     let machineId: String?
     weak var hub: AgentHubServer?
     let preferRelay: Bool
     private let session: URLSession
 
-    init(pc: SavedPC, hub: AgentHubServer? = nil, preferRelay: Bool = false) {
-        self.baseURL = pc.normalizedUrl
+    init(pc: SavedPC, hub: AgentHubServer? = nil, preferRelay: Bool = false, preferTunnel: Bool = false) {
+        let lanUrl = pc.normalizedUrl
+        let tunnelUrl = pc.normalizedTunnelUrl
+
+        var ordered: [String] = []
+        if preferTunnel, let t = tunnelUrl {
+            ordered.append(t)
+        }
+        ordered.append(lanUrl)
+        for extra in (pc.localUrls ?? []) {
+            let norm = SavedPC.normalizeUrl(extra)
+            if !ordered.contains(norm) {
+                ordered.append(norm)
+            }
+        }
+        if !preferTunnel, let t = tunnelUrl, !ordered.contains(t) {
+            ordered.append(t)
+        }
+
+        self.baseURL = ordered.first ?? lanUrl
+        self.fallbackURLs = Array(ordered.dropFirst())
         self.token = pc.token.trimmingCharacters(in: .whitespacesAndNewlines)
         self.machineId = pc.machineId
         self.hub = hub
@@ -102,6 +122,7 @@ final class APIClient {
     }
 
     private func makeRequest(
+        base: String,
         path: String,
         method: String = "GET",
         queryItems: [URLQueryItem] = [],
@@ -109,7 +130,7 @@ final class APIClient {
         contentType: String = "application/json",
         timeout: TimeInterval? = nil
     ) throws -> URLRequest {
-        guard var components = URLComponents(string: baseURL + path) else {
+        guard var components = URLComponents(string: base + path) else {
             throw APIError.invalidURL
         }
         if !queryItems.isEmpty {
@@ -121,7 +142,12 @@ final class APIClient {
 
         var req = URLRequest(url: url)
         req.httpMethod = method
-        if let timeout { req.timeoutInterval = timeout }
+        if let timeout {
+            req.timeoutInterval = timeout
+        } else if !base.lowercased().hasPrefix("https://") && !fallbackURLs.isEmpty {
+            // Fast fail on unreachable private LAN IPs when a Cloudflare Tunnel fallback exists
+            req.timeoutInterval = 2.5
+        }
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         if let body {
             req.httpBody = body
@@ -144,28 +170,38 @@ final class APIClient {
             return try await sendViaRelay(machineId: machineId, hub: hub, method: method, pathAndQuery: pathAndQuery, contentType: contentType, body: body)
         }
 
-        do {
-            let req = try makeRequest(path: path, method: method, queryItems: queryItems, body: body, contentType: contentType, timeout: timeout)
-            let (data, resp) = try await session.data(for: req)
-            guard let http = resp as? HTTPURLResponse else {
-                throw APIError.invalidURL
+        var lastError: Error = APIError.invalidURL
+        let candidates = [baseURL] + fallbackURLs
+
+        for base in candidates {
+            do {
+                let req = try makeRequest(base: base, path: path, method: method, queryItems: queryItems, body: body, contentType: contentType, timeout: timeout)
+                let (data, resp) = try await session.data(for: req)
+                guard let http = resp as? HTTPURLResponse else {
+                    throw APIError.invalidURL
+                }
+                if http.statusCode == 401 {
+                    throw APIError.unauthorized
+                }
+                if !(200...299).contains(http.statusCode) {
+                    let msg = String(data: data, encoding: .utf8) ?? "Không rõ lỗi"
+                    throw APIError.httpError(http.statusCode, msg)
+                }
+                return data
+            } catch let err as APIError {
+                if case .unauthorized = err { throw err }
+                if case .httpError(let code, _) = err, (400...499).contains(code) { throw err }
+                lastError = err
+            } catch {
+                lastError = error
             }
-            if http.statusCode == 401 {
-                throw APIError.unauthorized
-            }
-            if !(200...299).contains(http.statusCode) {
-                let msg = String(data: data, encoding: .utf8) ?? "Không rõ lỗi"
-                throw APIError.httpError(http.statusCode, msg)
-            }
-            return data
-        } catch let err as APIError {
-            throw err
-        } catch {
-            if let machineId, let hub, await hub.hasActiveSession(machineId: machineId) {
-                return try await sendViaRelay(machineId: machineId, hub: hub, method: method, pathAndQuery: pathAndQuery, contentType: contentType, body: body)
-            }
-            throw error
         }
+
+        if let machineId, let hub, await hub.hasActiveSession(machineId: machineId) {
+            return try await sendViaRelay(machineId: machineId, hub: hub, method: method, pathAndQuery: pathAndQuery, contentType: contentType, body: body)
+        }
+
+        throw lastError
     }
 
     private func sendViaRelay(
@@ -200,17 +236,25 @@ final class APIClient {
         }
     }
 
-    func ping(fastTimeout: TimeInterval = 3.0) async throws -> PingResponse {
+    func ping(fastTimeout: TimeInterval = 4.0) async throws -> PingResponse {
         try await send("/api/ping", timeout: fastTimeout)
     }
 
-    func pingDirectOnly(timeout: TimeInterval = 2.0) async throws -> PingResponse {
-        let req = try makeRequest(path: "/api/ping", timeout: timeout)
+    func pingSpecificBase(_ base: String, timeout: TimeInterval = 2.0) async throws -> PingResponse {
+        let req = try makeRequest(base: base, path: "/api/ping", timeout: timeout)
         let (data, resp) = try await session.data(for: req)
-        guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-            throw APIError.httpError((resp as? HTTPURLResponse)?.statusCode ?? 500, "Ping failed")
+        guard let http = resp as? HTTPURLResponse else {
+            throw APIError.invalidURL
+        }
+        if http.statusCode == 401 { throw APIError.unauthorized }
+        guard (200...299).contains(http.statusCode) else {
+            throw APIError.httpError(http.statusCode, "Ping failed")
         }
         return try JSONDecoder().decode(PingResponse.self, from: data)
+    }
+
+    func getPeers() async throws -> [PeerInfo] {
+        try await send("/api/peers", timeout: 6.0)
     }
 
     func getSystemInfo() async throws -> SystemInfo {
@@ -296,8 +340,10 @@ final class APIClient {
         }
 
         let req = try makeRequest(
+            base: baseURL,
             path: "/api/files/download",
-            queryItems: [URLQueryItem(name: "path", value: remotePath)]
+            queryItems: [URLQueryItem(name: "path", value: remotePath)],
+            timeout: 300
         )
         let (tempURL, resp) = try await session.download(for: req)
         guard let http = resp as? HTTPURLResponse else {
@@ -323,7 +369,8 @@ final class APIClient {
                 URLQueryItem(name: "filename", value: filename)
             ],
             body: data,
-            contentType: "application/octet-stream"
+            contentType: "application/octet-stream",
+            timeout: 300
         )
     }
 

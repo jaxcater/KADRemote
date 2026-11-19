@@ -10,6 +10,9 @@ public sealed class EmbeddedAgentConfig
     public int AgentPort { get; set; } = 7788;
     public bool StartWithWindows { get; set; } = true;
     public bool UdpDiscovery { get; set; } = true;
+    public bool EnableCloudflareTunnel { get; set; } = true;
+    public string? CloudflareTunnelToken { get; set; }
+    public string? CloudflareTunnelUrl { get; set; }
     public string? ExportedBy { get; set; }
     public string? ExportedAt { get; set; }
 }
@@ -125,6 +128,33 @@ public sealed record ErrorResponse(string Error);
 public sealed record OkResponse(bool Ok, string? Message = null, string? Path = null);
 public sealed record UploadResponse(bool Ok, List<string> SavedPaths);
 
+public sealed record PeerInfoDto(
+    string MachineId,
+    string DeviceName,
+    int AgentPort,
+    List<string> LocalUrls,
+    string? TunnelUrl,
+    double CpuUsagePercent,
+    long TotalMemoryBytes,
+    long UsedMemoryBytes,
+    long UptimeSeconds,
+    DateTimeOffset LastSeenUtc
+);
+
+public sealed record UdpPeerBeaconPacket(
+    string Type,
+    string TokenHash,
+    string MachineId,
+    string DeviceName,
+    int AgentPort,
+    List<string> LocalUrls,
+    string? TunnelUrl,
+    double CpuUsagePercent,
+    long TotalMemoryBytes,
+    long UsedMemoryBytes,
+    long UptimeSeconds
+);
+
 // Reverse Hub <-> Agent protocol messages
 public sealed record UdpDiscoverPacket(
     string Type,
@@ -141,6 +171,7 @@ public sealed record AgentRegisterMessage(
     string OsVersion,
     int AgentPort,
     List<string> LocalUrls,
+    string? TunnelUrl,
     double CpuUsagePercent,
     long TotalMemoryBytes,
     long UsedMemoryBytes,
@@ -151,6 +182,7 @@ public sealed record AgentHeartbeatMessage(
     string Type,
     string MachineId,
     List<string> LocalUrls,
+    string? TunnelUrl,
     double CpuUsagePercent,
     long TotalMemoryBytes,
     long UsedMemoryBytes,
@@ -195,6 +227,9 @@ public sealed record RelayWsEvent(
 [JsonSerializable(typeof(ErrorResponse))]
 [JsonSerializable(typeof(OkResponse))]
 [JsonSerializable(typeof(UploadResponse))]
+[JsonSerializable(typeof(PeerInfoDto))]
+[JsonSerializable(typeof(List<PeerInfoDto>))]
+[JsonSerializable(typeof(UdpPeerBeaconPacket))]
 [JsonSerializable(typeof(UdpDiscoverPacket))]
 [JsonSerializable(typeof(AgentRegisterMessage))]
 [JsonSerializable(typeof(AgentHeartbeatMessage))]

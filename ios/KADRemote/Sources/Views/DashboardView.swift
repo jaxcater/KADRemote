@@ -231,7 +231,11 @@ struct DashboardView: View {
         guard let client = store.client else { return }
         isLoading = true
         do {
-            info = try await client.getSystemInfo()
+            let loaded = try await client.getSystemInfo()
+            info = loaded
+            if let pcId = store.activePC?.id {
+                store.updatePCMetadata(from: loaded, for: pcId)
+            }
         } catch {
             statusBanner = error.localizedDescription
         }

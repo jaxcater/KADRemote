@@ -125,7 +125,7 @@ public sealed class SystemService
             .ToList();
     }
 
-    public SystemInfoDto GetSystemInfo(string deviceName, int port)
+    public SystemInfoDto GetSystemInfo(string deviceName, int port, string? tunnelUrl = null)
     {
         var (totalMem, usedMem) = GetMemoryBytes();
         var disks = new List<DiskInfoDto>();
@@ -158,7 +158,7 @@ public sealed class SystemService
             MonitorCount: monitors,
             Disks: disks,
             LocalUrls: GetLocalUrls(port),
-            TunnelUrl: null
+            TunnelUrl: tunnelUrl
         );
     }
 

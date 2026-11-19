@@ -20,7 +20,7 @@
    - Xem Task Manager & tắt ứng dụng bị treo, Khóa màn hình / Ngủ / Khởi động lại / Tắt PC.
 5. **Kết nối cực dễ qua mã QR hoặc Xuất cấu hình `Kad.exe` hàng loạt**
    - `Kad.exe` tích hợp sẵn **Cloudflare Quick Tunnel** (tự động tạo link `https://*.trycloudflare.com` không cần mở port router) và sinh **QR Code** để app iPhone quét kết nối trong 1 giây.
-   - **Xuất cấu hình (`Kad.exe` Headless)**: Tạo file `Kad.exe` cấu hình sẵn ngay trên iPhone để cài lên hàng chục Windows Server nội bộ — chạy ẩn hoàn toàn (không hiện Tray/Taskbar), siêu nhẹ RAM (~9 MB private RAM), tự tìm & kết nối về iPhone.
+   - **Xuất cấu hình (`Kad.exe` Headless)**: Tạo file `Kad.exe` cấu hình sẵn ngay trên iPhone để cài lên hàng chục Windows 10/11 nội bộ — chạy ẩn hoàn toàn (không hiện Tray/Taskbar), siêu nhẹ RAM (~9 MB private RAM), tự chạy lại khi khởi động máy, tự mở **Cloudflare Tunnel** (`https://*.trycloudflare.com` hoặc Named Tunnel) và tự động chuyển sang Tunnel khi iPhone ra ngoài dùng 4G/mạng khác.
 6. **Chạy nền trên iOS (khi user cho phép)**
    - Bật **Chạy nền** trong app iOS để giữ Hub lắng nghe và duy trì kết nối tới các Windows Server ngay cả khi chuyển app / tắt màn hình.
 

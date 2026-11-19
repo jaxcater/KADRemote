@@ -11,14 +11,27 @@ struct SavedPC: Codable, Identifiable, Equatable {
     var lastSeenCpu: Double?
     var lastSeenUsedRam: Int64?
     var lastSeenTotalRam: Int64?
+    var tunnelUrl: String?
+    var localUrls: [String]?
 
     var normalizedUrl: String {
-        var trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        Self.normalizeUrl(url)
+    }
+
+    var normalizedTunnelUrl: String? {
+        guard let t = tunnelUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else {
+            return nil
+        }
+        return Self.normalizeUrl(t, defaultScheme: "https://")
+    }
+
+    static func normalizeUrl(_ raw: String, defaultScheme: String = "http://") -> String {
+        var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         while trimmed.hasSuffix("/") {
             trimmed.removeLast()
         }
         if !trimmed.lowercased().hasPrefix("http://") && !trimmed.lowercased().hasPrefix("https://") {
-            trimmed = "http://" + trimmed
+            trimmed = defaultScheme + trimmed
         }
         return trimmed
     }
@@ -31,6 +44,9 @@ struct AgentExportConfig: Codable {
     var agentPort: Int
     var startWithWindows: Bool
     var udpDiscovery: Bool
+    var enableCloudflareTunnel: Bool = true
+    var cloudflareTunnelToken: String?
+    var cloudflareTunnelUrl: String?
     var exportedBy: String?
     var exportedAt: String?
 }
@@ -39,6 +55,7 @@ struct AgentLiveStatus: Equatable {
     let machineId: String
     let deviceName: String
     let localUrls: [String]
+    let tunnelUrl: String?
     let agentPort: Int
     let remoteIP: String
     let cpuUsagePercent: Double
@@ -46,6 +63,21 @@ struct AgentLiveStatus: Equatable {
     let usedMemoryBytes: Int64
     let uptimeSeconds: Int64
     let lastHeartbeat: Date
+}
+
+struct PeerInfo: Codable, Identifiable {
+    let machineId: String
+    let deviceName: String
+    let agentPort: Int
+    let localUrls: [String]
+    let tunnelUrl: String?
+    let cpuUsagePercent: Double
+    let totalMemoryBytes: Int64
+    let usedMemoryBytes: Int64
+    let uptimeSeconds: Int64
+    let lastSeenUtc: String
+
+    var id: String { machineId }
 }
 
 struct PingResponse: Codable {

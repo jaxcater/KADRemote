@@ -10,6 +10,9 @@ struct ExportConfigSheet: View {
     @State private var agentPortText: String = "7788"
     @State private var startWithWindows: Bool = true
     @State private var udpDiscovery: Bool = true
+    @State private var enableCloudflareTunnel: Bool = true
+    @State private var cloudflareTunnelToken: String = ""
+    @State private var cloudflareTunnelUrl: String = ""
 
     @State private var isBuilding: Bool = false
     @State private var exportedURL: URL?
@@ -20,17 +23,17 @@ struct ExportConfigSheet: View {
             Form {
                 Section {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Tạo Kad.exe cấu hình sẵn cho hàng loạt Windows Server")
+                        Text("Tạo Kad.exe cấu hình sẵn cho Windows 10/11")
                             .font(.subheadline.bold())
                             .foregroundColor(.cyan)
-                        Text("File Kad.exe xuất ra chạy hoàn toàn ẩn (không hiện Tray/Taskbar, tối ưu RAM), tự động kết nối về iPhone này mà không cần quét QR trên từng máy.")
+                        Text("File Kad.exe chạy ẩn hoàn toàn (không Tray/Taskbar, tự chạy khi khởi động lại), tự động đồng bộ link Cloudflare Tunnel để bạn điều khiển cả khi đi ra ngoài dùng 4G / mạng khác.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
                     .padding(.vertical, 4)
                 }
 
-                Section("Địa chỉ iPhone (Controller)") {
+                Section("Địa chỉ iPhone (LAN / VPN)") {
                     TextField("IP / Host của iPhone (VD: 192.168.1.50)", text: $controllerHost)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -74,6 +77,28 @@ struct ExportConfigSheet: View {
                             .keyboardType(.numberPad)
                             .multilineTextAlignment(.trailing)
                             .frame(width: 90)
+                    }
+                }
+
+                Section("Truy cập từ xa khác mạng (Cloudflare Tunnel)") {
+                    Toggle("Bật Cloudflare Tunnel (4G / Khác Wi-Fi)", isOn: $enableCloudflareTunnel)
+                        .tint(.cyan)
+
+                    if enableCloudflareTunnel {
+                        Text("Mặc định dùng Quick Tunnel miễn phí (tự tạo link https://*.trycloudflare.com và đồng bộ về iPhone, không cần tài khoản).")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        DisclosureGroup("Named Tunnel cố định (Tùy chọn)") {
+                            TextField("Cloudflare Tunnel Token (để trống nếu dùng miễn phí)", text: $cloudflareTunnelToken)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                            TextField("Domain cố định (VD: https://srv1.domain.com)", text: $cloudflareTunnelUrl)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .keyboardType(.URL)
+                        }
+                        .font(.subheadline)
                     }
                 }
 
@@ -175,6 +200,13 @@ struct ExportConfigSheet: View {
             return
         }
 
+        let cleanCfToken = cloudflareTunnelToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanCfUrl = cloudflareTunnelUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        if enableCloudflareTunnel && !cleanCfToken.isEmpty && cleanCfUrl.isEmpty {
+            errorMessage = "Khi dùng Named Tunnel Token, hãy nhập Domain cố định tương ứng."
+            return
+        }
+
         hub.updatePorts(hub: hubPort, agent: agentPort)
         isBuilding = true
 
@@ -185,6 +217,9 @@ struct ExportConfigSheet: View {
             agentPort: agentPort,
             startWithWindows: startWithWindows,
             udpDiscovery: udpDiscovery,
+            enableCloudflareTunnel: enableCloudflareTunnel,
+            cloudflareTunnelToken: cleanCfToken.isEmpty ? nil : cleanCfToken,
+            cloudflareTunnelUrl: cleanCfUrl.isEmpty ? nil : cleanCfUrl,
             exportedBy: UIDevice.current.name,
             exportedAt: ISO8601DateFormatter().string(from: Date())
         )

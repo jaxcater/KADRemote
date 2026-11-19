@@ -34,7 +34,8 @@ enum NetworkUtils {
                 if getnameinfo(addr, socklen_t(addr.pointee.sa_len), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST) == 0 {
                     let ip = String(cString: hostname)
                     let name = String(cString: current.pointee.ifa_name)
-                    if !ip.hasPrefix("169.254.") && !ip.hasPrefix("127.") {
+                    // Exclude link-local, loopback, and cellular (pdp_ip*) interfaces
+                    if !ip.hasPrefix("169.254.") && !ip.hasPrefix("127.") && !name.hasPrefix("pdp_ip") {
                         results.append(InterfaceAddress(name: name, ip: ip))
                     }
                 }
@@ -86,6 +87,7 @@ final class AgentHubServer: ObservableObject {
     @Published var onlineAgents: [String: AgentLiveStatus] = [:]
 
     var onAgentRegistered: ((AgentLiveStatus, String) -> Void)?
+    var onAgentHeartbeat: ((AgentLiveStatus) -> Void)?
     var onAgentDisconnected: ((String, String) -> Void)?
 
     private var wsListener: NWListener?
@@ -295,23 +297,23 @@ final class AgentHubServer: ObservableObject {
         onAgentDisconnected?(machineId, name)
     }
 
-    @discardableResult
-    private func handleAgentMessage(_ text: String, conn: NWConnection, connId: String) -> String? {
+    private func handleAgentMessage(_ text: String, conn: NWConnection, connId: String) {
         guard let data = text.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let type = obj["type"] as? String else { return nil }
+              let type = obj["type"] as? String else { return }
 
         switch type {
         case "register":
             let token = obj["token"] as? String ?? ""
             guard token == controllerToken else {
                 conn.cancel()
-                return nil
+                return
             }
             let machineId = obj["machineId"] as? String ?? connId
             let deviceName = obj["deviceName"] as? String ?? "Windows Server"
             let agentPort = obj["agentPort"] as? Int ?? defaultAgentPort
             let localUrls = obj["localUrls"] as? [String] ?? []
+            let tunnelUrl = obj["tunnelUrl"] as? String
             let cpu = obj["cpuUsagePercent"] as? Double ?? 0
             let totalMem = (obj["totalMemoryBytes"] as? NSNumber)?.int64Value ?? 0
             let usedMem = (obj["usedMemoryBytes"] as? NSNumber)?.int64Value ?? 0
@@ -325,6 +327,7 @@ final class AgentHubServer: ObservableObject {
                 machineId: machineId,
                 deviceName: deviceName,
                 localUrls: localUrls,
+                tunnelUrl: tunnelUrl,
                 agentPort: agentPort,
                 remoteIP: remoteIP,
                 cpuUsagePercent: cpu,
@@ -335,12 +338,12 @@ final class AgentHubServer: ObservableObject {
             )
             onlineAgents[machineId] = status
             onAgentRegistered?(status, token)
-            return machineId
 
         case "heartbeat":
             guard let machineId = obj["machineId"] as? String,
-                  let existing = onlineAgents[machineId] else { return nil }
+                  let existing = onlineAgents[machineId] else { return }
             let localUrls = obj["localUrls"] as? [String] ?? existing.localUrls
+            let tunnelUrl = (obj["tunnelUrl"] as? String) ?? existing.tunnelUrl
             let cpu = obj["cpuUsagePercent"] as? Double ?? existing.cpuUsagePercent
             let totalMem = (obj["totalMemoryBytes"] as? NSNumber)?.int64Value ?? existing.totalMemoryBytes
             let usedMem = (obj["usedMemoryBytes"] as? NSNumber)?.int64Value ?? existing.usedMemoryBytes
@@ -350,6 +353,7 @@ final class AgentHubServer: ObservableObject {
                 machineId: machineId,
                 deviceName: existing.deviceName,
                 localUrls: localUrls,
+                tunnelUrl: tunnelUrl,
                 agentPort: existing.agentPort,
                 remoteIP: existing.remoteIP,
                 cpuUsagePercent: cpu,
@@ -359,20 +363,19 @@ final class AgentHubServer: ObservableObject {
                 lastHeartbeat: Date()
             )
             onlineAgents[machineId] = updated
-            return machineId
+            onAgentHeartbeat?(updated)
 
         case "http_res":
             let reqId = obj["id"] as? String ?? ""
-            guard let cont = pendingHttp.removeValue(forKey: reqId) else { return nil }
+            guard let cont = pendingHttp.removeValue(forKey: reqId) else { return }
             let statusCode = obj["statusCode"] as? Int ?? 500
             let b64 = obj["bodyBase64"] as? String ?? ""
             let bodyData = Data(base64Encoded: b64) ?? Data()
             cont.resume(returning: (statusCode, bodyData))
-            return nil
 
         case "ws_msg":
             let streamId = obj["streamId"] as? String ?? ""
-            guard let handle = activeRelays[streamId] else { return nil }
+            guard let handle = activeRelays[streamId] else { return }
             let isBin = obj["isBinary"] as? Bool ?? false
             let payload = obj["data"] as? String ?? ""
             if isBin {
@@ -382,7 +385,6 @@ final class AgentHubServer: ObservableObject {
             } else {
                 handle.onMessage?(.success(.string(payload)))
             }
-            return nil
 
         case "ws_close":
             let streamId = obj["streamId"] as? String ?? ""
@@ -390,10 +392,9 @@ final class AgentHubServer: ObservableObject {
                 let errMsg = obj["error"] as? String ?? "Stream closed"
                 handle.onMessage?(.failure(APIError.httpError(502, errMsg)))
             }
-            return nil
 
         default:
-            return nil
+            break
         }
     }
 

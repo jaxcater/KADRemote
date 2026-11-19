@@ -18,11 +18,15 @@ var screen = new ScreenCaptureService();
 var input = new InputSimulationService(screen);
 var powershell = new PowerShellService(config);
 var files = new FileService();
+using var tunnel = new CloudflareTunnelService(config);
+using var peers = new PeerDiscoveryService(config, system, tunnel);
 
-await using var apiServer = new AgentApiServer(config, system, screen, input, powershell, files);
-await using var controllerLink = new ControllerLinkService(config, system);
+await using var apiServer = new AgentApiServer(config, system, screen, input, powershell, files, tunnel, peers);
+await using var controllerLink = new ControllerLinkService(config, system, tunnel);
 
 await apiServer.StartAsync();
+tunnel.Start();
+peers.Start();
 controllerLink.Start();
 
 // Trim initial startup working set to minimize idle RAM on Windows 10/11
@@ -38,7 +42,6 @@ static void EnablePerMonitorDpiAwareness()
 {
     try
     {
-        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (IntPtr)(-4) on Windows 10 1703+ & Windows 11
         if (!NativeDpi.SetProcessDpiAwarenessContext((IntPtr)(-4)))
             NativeDpi.SetProcessDPIAware();
     }

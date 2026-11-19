@@ -18,20 +18,24 @@ public sealed class ControllerLinkService : IAsyncDisposable
 {
     private readonly AgentConfigService _config;
     private readonly SystemService _system;
+    private readonly CloudflareTunnelService _tunnel;
     private readonly HttpClient _localHttp;
     private readonly ConcurrentDictionary<string, ClientWebSocket> _relayedSockets = new();
     private readonly CancellationTokenSource _cts = new();
     private SemaphoreSlim? _networkWakeSignal;
+    private SemaphoreSlim? _heartbeatWakeSignal;
 
     private Task? _loopTask;
     private string _activeHost;
 
-    public ControllerLinkService(AgentConfigService config, SystemService system)
+    public ControllerLinkService(AgentConfigService config, SystemService system, CloudflareTunnelService tunnel)
     {
         _config = config;
         _system = system;
+        _tunnel = tunnel;
         _activeHost = config.Config.ControllerHost;
         _networkWakeSignal = new SemaphoreSlim(0, 1);
+        _heartbeatWakeSignal = new SemaphoreSlim(0, 1);
         _localHttp = new HttpClient
         {
             BaseAddress = new Uri($"http://127.0.0.1:{config.Config.AgentPort}"),
@@ -40,6 +44,17 @@ public sealed class ControllerLinkService : IAsyncDisposable
 
         NetworkChange.NetworkAddressChanged += OnNetworkChanged;
         NetworkChange.NetworkAvailabilityChanged += OnNetworkAvailabilityChanged;
+        _tunnel.TunnelUrlChanged += OnTunnelUrlChanged;
+    }
+
+    private void OnTunnelUrlChanged(string? _)
+    {
+        try
+        {
+            if (_heartbeatWakeSignal is { CurrentCount: 0 } sem)
+                sem.Release();
+        }
+        catch { }
     }
 
     private void OnNetworkChanged(object? sender, EventArgs e) => SignalNetworkWake();
@@ -162,6 +177,7 @@ public sealed class ControllerLinkService : IAsyncDisposable
             OsVersion: Environment.OSVersion.VersionString,
             AgentPort: _config.Config.AgentPort,
             LocalUrls: _system.GetLocalUrls(_config.Config.AgentPort),
+            TunnelUrl: _tunnel.PublicUrl,
             CpuUsagePercent: _system.GetCpuUsagePercent(),
             TotalMemoryBytes: totalMem,
             UsedMemoryBytes: usedMem,
@@ -177,12 +193,17 @@ public sealed class ControllerLinkService : IAsyncDisposable
             {
                 try
                 {
-                    await Task.Delay(15000, sessionCts.Token);
+                    if (_heartbeatWakeSignal != null)
+                        await _heartbeatWakeSignal.WaitAsync(15000, sessionCts.Token);
+                    else
+                        await Task.Delay(15000, sessionCts.Token);
+
                     var (tot, used) = _system.GetMemoryBytes();
                     var hb = new AgentHeartbeatMessage(
                         Type: "heartbeat",
                         MachineId: _config.MachineId,
                         LocalUrls: _system.GetLocalUrls(_config.Config.AgentPort),
+                        TunnelUrl: _tunnel.PublicUrl,
                         CpuUsagePercent: _system.GetCpuUsagePercent(),
                         TotalMemoryBytes: tot,
                         UsedMemoryBytes: used,
@@ -441,6 +462,7 @@ public sealed class ControllerLinkService : IAsyncDisposable
     {
         NetworkChange.NetworkAddressChanged -= OnNetworkChanged;
         NetworkChange.NetworkAvailabilityChanged -= OnNetworkAvailabilityChanged;
+        _tunnel.TunnelUrlChanged -= OnTunnelUrlChanged;
         _cts.Cancel();
         if (_loopTask != null)
         {
@@ -454,6 +476,8 @@ public sealed class ControllerLinkService : IAsyncDisposable
         _localHttp.Dispose();
         _networkWakeSignal?.Dispose();
         _networkWakeSignal = null;
+        _heartbeatWakeSignal?.Dispose();
+        _heartbeatWakeSignal = null;
         _cts.Dispose();
     }
 }

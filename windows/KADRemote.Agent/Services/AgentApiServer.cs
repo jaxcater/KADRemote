@@ -21,6 +21,8 @@ public sealed class AgentApiServer : IAsyncDisposable
     private readonly InputSimulationService _input;
     private readonly PowerShellService _powershell;
     private readonly FileService _files;
+    private readonly CloudflareTunnelService _tunnel;
+    private readonly PeerDiscoveryService _peers;
 
     private WebApplication? _app;
 
@@ -30,7 +32,9 @@ public sealed class AgentApiServer : IAsyncDisposable
         ScreenCaptureService screen,
         InputSimulationService input,
         PowerShellService powershell,
-        FileService files)
+        FileService files,
+        CloudflareTunnelService tunnel,
+        PeerDiscoveryService peers)
     {
         _config = config;
         _system = system;
@@ -38,6 +42,8 @@ public sealed class AgentApiServer : IAsyncDisposable
         _input = input;
         _powershell = powershell;
         _files = files;
+        _tunnel = tunnel;
+        _peers = peers;
     }
 
     public async Task StartAsync()
@@ -91,8 +97,10 @@ public sealed class AgentApiServer : IAsyncDisposable
 
         app.MapGet("/api/ping", () => Results.Ok(new PingResponse(true, _config.DeviceName, DateTimeOffset.UtcNow)));
 
+        app.MapGet("/api/peers", () => Results.Ok(_peers.GetPeers()));
+
         app.MapGet("/api/system/info", () =>
-            Results.Ok(_system.GetSystemInfo(_config.DeviceName, _config.Config.AgentPort)));
+            Results.Ok(_system.GetSystemInfo(_config.DeviceName, _config.Config.AgentPort, _tunnel.PublicUrl)));
 
         app.MapGet("/api/processes", () => Results.Ok(_system.GetProcesses()));
 
